@@ -1,3 +1,9 @@
+# This is a (too) simple DTD to tDOM schema converter.
+#
+# It should work for not namespaced document types and namespaced
+# document types with the elements in a default namespace. In case of
+# namespaced document types with prefixed elements the generated
+# schema file will not be usable, but may be a starting point.
 
 package require tdom
 package require uri
@@ -77,7 +83,25 @@ proc fromDTD_generate {} {
     variable dtdElements
     variable dtdAttributes
     variable nslookup
-
+    
+    if {$dtdStart ne ""} {
+        if {![info exists dtdElements($dtdStart)]} {
+            puts "Document element not defined."
+            exit 1
+        }
+        set ns ""
+        foreach {attkey attDef} [array get dtdAttributes $dtdStart,*] {
+            lassign $attDef attname type default isRequired
+            if {$attname eq "xmlns"} {
+                set ns $default
+            }
+        }
+        if {$ns eq ""} {
+            puts "start $dtdStart"
+        } else {
+            puts "start $dtdStart $ns"
+        }
+    }
     set elements [lsort [array names dtdElements]]
     if {$dtdStart ne "" && [info exists dtdElements($dtdStart)]} {
         set startInd [lsearch -exact $elements $dtdStart]
@@ -243,7 +267,7 @@ proc fromDTDfile {file} {
 }
 
 proc usage {} {
-    puts "$argv0 ?options? file"
+    puts "$argv0 <XML-with-DTD>"
 }
 
 proc run {args} {

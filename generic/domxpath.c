@@ -2,9 +2,6 @@
 |   Copyright (c) 1999-2001 Jochen Loewer (loewerj@hotmail.com)
 |-----------------------------------------------------------------------------
 |
-|   $Id$
-|
-|
 |   A XPath implementation (lexer/parser/evaluator) for tDOM,
 |   the DOM implementation for Tcl.
 |   Based on November 16 1999 Recommendation of the W3C
@@ -5267,6 +5264,7 @@ xpathEvalAst (
     ast             t,
     xpathResultSet *nodeList,
     domNode        *node,
+    xpathCBs       * cbs,
     xpathResultSet *rs,
     char          **errMsg
     )
@@ -5285,7 +5283,7 @@ xpathEvalAst (
         if (first) {
             rc = xpathEvalStepAndPredicates (t, nodeList, node,
                                              node, 0, &docOrder,
-                                             NULL, rs, errMsg);
+                                             cbs, rs, errMsg);
             CHECK_RC;
             first = 0;
         } else {

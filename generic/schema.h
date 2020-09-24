@@ -17,7 +17,7 @@
 |
 |
 |   written by Rolf Ade
-|   Nov, Dec 2018
+|   2018-2020
 |
 \---------------------------------------------------------------------------*/
 
@@ -59,11 +59,12 @@ typedef struct
     SchemaConstraintFreeFunc freeData;
 } SchemaConstraint;
 
-typedef struct
+typedef struct SchemaAttr
 {
     char              *namespace;
     char              *name;
     int                required;
+    struct SchemaAttr *next;
     struct SchemaCP   *cp;
 } SchemaAttr;
 
@@ -75,7 +76,8 @@ typedef unsigned int SchemaFlags;
 #define AMBIGUOUS_PATTERN       4
 #define LOCAL_DEFINED_ELEMENT   8
 #define CONSTRAINT_TEXT_CHILD  16
-#define MIXED_CONTENT          32 
+#define MIXED_CONTENT          32
+#define ELEMENTTYPE_DEF        64
 
 typedef struct domKeyConstraint {
     char  *name;
@@ -83,6 +85,8 @@ typedef struct domKeyConstraint {
     ast   *fields;
     int    nrFields;
     int    flags;
+    char  *emptyFieldSetValue;
+    int    efsv_len;
     struct domKeyConstraint *next;
 } domKeyConstraint;
 
@@ -99,17 +103,20 @@ typedef struct SchemaCP
     Schema_CP_Type    type;
     char             *namespace;
     char             *name;
+    char             *typeName;
     struct SchemaCP  *next;
     SchemaFlags       flags;
     struct SchemaCP **content;
     SchemaQuant      *quants;
     unsigned int      nc;
+    void             *typedata;
     SchemaAttr      **attrs;
     unsigned int      numAttr;
     unsigned int      numReqAttr;
     domKeyConstraint *domKeys;
     SchemaKeySpace   *keySpace;
     Tcl_Obj          *defScript;
+    Tcl_Obj          *associated;
 } SchemaCP;
 
 typedef struct SchemaValidationStack
@@ -141,6 +148,7 @@ typedef struct SchemaData_
     char *start;
     char *startNamespace;
     Tcl_HashTable element;
+    Tcl_HashTable elementType;
     Tcl_HashTable namespace;
     Tcl_HashEntry *emptyNamespace;
     char **prefixns;
@@ -159,6 +167,7 @@ typedef struct SchemaData_
     int       evalError;
     Tcl_Obj  *reportCmd;
     SchemaValidationStack *lastMatchse;
+    int       recoverFlags;
     Tcl_Obj **evalStub;
     Tcl_Obj **textStub;
     char *currentNamespace;
@@ -186,10 +195,15 @@ typedef struct SchemaData_
     Tcl_HashTable keySpaces;
     XML_Parser parser;
     domNode *node;
+    domNode *insideNode;
+    int choiceHashThreshold;
+    int attributeHashThreshold;
+    char *wsbuf;
+    int wsbufLen;
 } SchemaData;
 
 int 
-schemaInstanceCmd (
+tDOM_schemaInstanceCmd (
     ClientData clientData,
     Tcl_Interp *interp,
     int objc,
@@ -201,14 +215,15 @@ void tDOM_SchemaInit (
     );
 
 int
-probeElement (
+tDOM_probeElement (
     Tcl_Interp *interp,
     SchemaData *sdata,
     const char *name,
     void *namespace
     );
 
-int probeAttributes (
+int
+tDOM_probeAttributes (
     Tcl_Interp *interp,
     SchemaData *sdata,
     const char **attr
@@ -219,23 +234,24 @@ typedef struct domNode domNode;
 typedef struct domAttrNode domAttrNode;
 typedef struct domTextNode domTextNode;
 
-int probeDomAttributes (
+int tDOM_probeDomAttributes (
     Tcl_Interp *interp,
     SchemaData *sdata,
     domAttrNode *attr
     );
     
 int
-probeElementEnd (
+tDOM_probeElementEnd (
     Tcl_Interp * interp,
     SchemaData *sdata
     );
 
 int
-probeText (
+tDOM_probeText (
     Tcl_Interp *interp,
     SchemaData *sdata,
-    char *text
+    char *text,
+    int *only_whites
     );
 
 void

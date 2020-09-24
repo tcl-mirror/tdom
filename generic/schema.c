@@ -17,17 +17,25 @@
 |
 |
 |   written by Rolf Ade
-|   2018-2019
+|   2018-2020
 |
 \---------------------------------------------------------------------------*/
-
-#ifndef TDOM_NO_SCHEMA
 
 #include <tdom.h>
 #include <tcldom.h>
 #include <domxpath.h>
 #include <schema.h>
+
+#ifndef TDOM_NO_SCHEMA
+
 #include <stdint.h>
+#include <fcntl.h>
+
+#ifdef _MSC_VER
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 /* #define DEBUG */
 /* #define DDEBUG */
@@ -46,6 +54,21 @@
 # define DDBG(x)
 #endif
 
+
+/*----------------------------------------------------------------------------
+| Choice/attribute handling method threshold
+|
+\---------------------------------------------------------------------------*/
+#ifndef TDOM_CHOICE_HASH_THRESHOLD
+# define TDOM_CHOICE_HASH_THRESHOLD 5
+#endif
+#ifndef TDOM_ATTRIBUTE_HASH_THRESHOLD
+# define TDOM_ATTRIBUTE_HASH_THRESHOLD 5
+#endif
+#ifndef TDOM_EXPAT_READ_SIZE
+# define TDOM_EXPAT_READ_SIZE (1024*8)
+#endif
+
 /*----------------------------------------------------------------------------
 |   Initial buffer sizes
 |
@@ -61,6 +84,38 @@
 #endif
 #ifndef ATTR_ARRAY_INIT
 #  define ATTR_ARRAY_INIT 4
+#endif
+#ifndef WHITESPACETC_BUFFER_LEN_INIT
+#  define WHITESPACETC_BUFFER_LEN_INIT 200
+#endif
+
+/*----------------------------------------------------------------------------
+|   Local defines
+|
+\---------------------------------------------------------------------------*/
+#ifndef O_BINARY
+# ifdef _O_BINARY
+#  define O_BINARY _O_BINARY
+# else
+#  define O_BINARY 0
+# endif
+#endif
+#if !defined(PTR2UINT)
+# if defined(HAVE_UINTPTR_T) || defined(uintptr_t)
+#  define PTR2UINT(p) ((unsigned int)(uintptr_t)(p))
+# else
+#  define PTR2UINT(p) ((unsigned int)(p))
+# endif
+#endif
+#if !defined(UINT2PTR)
+# if defined(HAVE_UINTPTR_T) || defined(uintptr_t)
+#  define UINT2PTR(p) ((void *)(uintptr_t)(p))
+# else
+#  define UINT2PTR(p) ((void *)(p))
+# endif
+#endif
+#ifndef TCL_MATCH_NOCASE
+# define TCL_MATCH_NOCASE 1
 #endif
 
 /*----------------------------------------------------------------------------
@@ -80,29 +135,33 @@ typedef struct
 } ValidateMethodData;
 
 typedef enum {
-    MATCH_GLOBAL,
+    MATCH_GLOBAL = 1,
     MATCH_ELEMENT_START,
     MATCH_ELEMENT_END,
     MATCH_TEXT,
     MATCH_ATTRIBUTE_TEXT,
-    MATCH_DOM_KEYCONSTRAINT
+    MATCH_DOM_KEYCONSTRAINT,
+    MATCH_DOM_XPATH_BOOLEAN
 } ValidationAction;
 
 static char *ValidationAction2str[] = {
+    "NOT_USED",
     "MATCH_GLOBAL",
     "MATCH_ELEMENT_START",
     "MATCH_ELEMENT_END",
     "MATCH_TEXT",
     "MATCH_ATTRIBUTE_TEXT",
-    "MATCH_DOM_KEYCONSTRAINT"
+    "MATCH_DOM_KEYCONSTRAINT",
+    "MATCH_DOM_XPATH_BOOLEAN"
 };
     
 typedef enum {
     DOM_KEYCONSTRAINT,
+    DOM_XPATH_BOOLEAN,
     MISSING_ATTRIBUTE,
     MISSING_ELEMENT_MATCH_START,
     MISSING_ELEMENT_MATCH_END,
-    MISSING_ELEMENT_MATCH_TEXT,
+    UNEXPECTED_TEXT,
     MISSING_TEXT_MATCH_START,
     MISSING_TEXT_MATCH_END,
     UNEXPECTED_ROOT_ELEMENT,
@@ -120,10 +179,11 @@ typedef enum {
 
 static char *ValidationErrorType2str[] = {
     "DOM_KEYCONSTRAINT",
+    "DOM_XPATH_BOOLEAN",
     "MISSING_ATTRIBUTE",
     "MISSING_ELEMENT",
     "MISSING_ELEMENT",
-    "MISSING_ELEMENT",
+    "UNEXPECTED_TEXT",
     "MISSING_TEXT",
     "MISSING_TEXT",
     "UNEXPECTED_ROOT_ELEMENT",
@@ -138,20 +198,38 @@ static char *ValidationErrorType2str[] = {
     "INVALID_ATTRIBUTE_VALUE",
     "INVALID_VALUE"
 };
-    
+
+/*----------------------------------------------------------------------------
+|   Recovering related flage
+|
+\---------------------------------------------------------------------------*/
+
+#define RECOVER_FLAG_REWIND 1
+#define RECOVER_FLAG_DONT_REPORT 2
+#define RECOVER_FLAG_IGNORE 4
+#define RECOVER_FLAG_MATCH_END_CONTINUE 8
+
+/*----------------------------------------------------------------------------
+|   [schemacmd info expected] related flags
+|
+\---------------------------------------------------------------------------*/
+
+#define EXPECTED_IGNORE_MATCHED 1
+#define EXPECTED_ONLY_MANDATORY 2
+#define EXPECTED_PROBE_MAYSKIP 4
+
 /*----------------------------------------------------------------------------
 |   domKeyConstraint related flage
 |
 \---------------------------------------------------------------------------*/
 
 #define DKC_FLAG_IGNORE_EMPTY_FIELD_SET 1
+#define DKC_FLAG_BOOLEAN 2
 
 /*----------------------------------------------------------------------------
 |   Macros
 |
 \---------------------------------------------------------------------------*/
-#define TMALLOC(t) (t*)MALLOC(sizeof(t))
-
 #define SetResult(str) Tcl_ResetResult(interp); \
                      Tcl_SetStringObj(Tcl_GetObjResult(interp), (str), -1)
 #define SetResultV(str) if (!sdata->evalError) { \
@@ -171,7 +249,7 @@ static char *ValidationErrorType2str[] = {
 #define SetBooleanResult(i) Tcl_ResetResult(interp); \
                      Tcl_SetBooleanObj(Tcl_GetObjResult(interp), (i))
 
-#define SPACE(c) ((c) == ' ' || (c) == '\n' || (c) == '\t' || (c) == '\r')
+#define SPACE(c) IS_XML_WHITESPACE ((c))
     
 #define checkNrArgs(l,h,err) if (objc < l || objc > h) {      \
         SetResult (err);                                      \
@@ -252,6 +330,9 @@ static void SetActiveSchemaData (SchemaData *v)
             SetResult ("This recursive call is not allowed");           \
             return TCL_ERROR;                                           \
         }                                                               \
+    } else if (!sdata->defineToplevel) {                                \
+        SetResult ("Command only allowed at lop level");                \
+        return TCL_ERROR;                                               \
     }
       
 #define CHECK_EVAL                                                      \
@@ -259,7 +340,13 @@ static void SetActiveSchemaData (SchemaData *v)
         SetResult ("This method is not allowed in nested evaluation");  \
         return TCL_ERROR;                                               \
     }
-    
+
+#define CHECK_REWIND                                                    \
+    if (sdata->recoverFlags & RECOVER_FLAG_REWIND) {                    \
+        rewindStack (sdata);                                            \
+        sdata->recoverFlags &= ~RECOVER_FLAG_REWIND;                    \
+    }                                                                   \
+
 #define REMEMBER_PATTERN(pattern)                                       \
     if (sdata->numPatternList == sdata->patternListSize) {              \
         sdata->patternList = (SchemaCP **) REALLOC (                    \
@@ -318,9 +405,26 @@ static void SetActiveSchemaData (SchemaData *v)
     }                                             \
 
 
-#define updateStack(se,cp,ac)                     \
-    se->activeChild = ac;                         \
-    se->hasMatched = 1;                           \
+#define updateStack(sdata,se,ac)                        \
+    if (!(sdata->recoverFlags & RECOVER_FLAG_REWIND)) { \
+        se->activeChild = ac;                           \
+        se->hasMatched = 1;                             \
+    }                                                   \
+
+
+#ifndef TCL_THREADS
+SchemaData *
+tdomGetSchemadata (Tcl_Interp *interp) 
+{
+    return activeSchemaData;
+}
+#else
+SchemaData *
+tdomGetSchemadata (void) 
+{
+    return GETASI;
+}
+#endif
 
 static SchemaCP*
 initSchemaCP (
@@ -336,6 +440,8 @@ initSchemaCP (
     pattern->type = type;
     switch (type) {
     case SCHEMA_CTYPE_NAME:
+        pattern->flags |= CONSTRAINT_TEXT_CHILD;
+        /* Fall thru. */
     case SCHEMA_CTYPE_PATTERN:
         pattern->namespace = (char *)namespace;
         pattern->name = name;
@@ -390,7 +496,10 @@ static void serializeCP (
             fprintf (stderr, "\tAs placeholder defined NAME\n");
         }
         if (pattern->flags & LOCAL_DEFINED_ELEMENT) {
-            fprintf (stderr, "\tAs placeholder defined NAME\n");
+            fprintf (stderr, "\tLocal defined NAME\n");
+        }
+        if (pattern->flags & ELEMENTTYPE_DEF) {
+            fprintf (stderr, "\tElementtype '%s'\n", pattern->typeName);
         }
         /* Fall thru. */
     case SCHEMA_CTYPE_CHOICE:
@@ -461,6 +570,7 @@ static void freedomKeyConstraints (
     while (kc) {
         knext = kc->next;
         if (kc->name) FREE (kc->name);
+        if (kc->emptyFieldSetValue) FREE (kc->emptyFieldSetValue);
         xpathFreeAst (kc->selector);
         for (i = 0; i < kc->nrFields; i++) {
             xpathFreeAst (kc->fields[i]);
@@ -477,13 +587,13 @@ static void freeSchemaCP (
 {
     int i;
     SchemaConstraint *sc;
-
+    
     switch (pattern->type) {
     case SCHEMA_CTYPE_ANY:
         /* do nothing */
         break;
     case SCHEMA_CTYPE_VIRTUAL:
-        for (i = 0; i < pattern->nc - 1; i++) {
+        for (i = 0; i < pattern->nc; i++) {
             Tcl_DecrRefCount ((Tcl_Obj *)pattern->content[i]);
         }
         FREE (pattern->content);
@@ -507,10 +617,17 @@ static void freeSchemaCP (
             FREE (pattern->attrs);
         }
         freedomKeyConstraints (pattern->domKeys);
+        if (pattern->typedata) {
+            Tcl_DeleteHashTable ((Tcl_HashTable *) pattern->typedata);
+            FREE (pattern->typedata);
+        }
         break;
     }
     if (pattern->defScript) {
         Tcl_DecrRefCount (pattern->defScript);
+    }
+    if (pattern->associated) {
+        Tcl_DecrRefCount (pattern->associated);
     }
     FREE (pattern);
 }
@@ -529,6 +646,7 @@ initSchemaData (
     sdata->self = Tcl_NewStringObj (name, len);
     Tcl_IncrRefCount (sdata->self);
     Tcl_InitHashTable (&sdata->element, TCL_STRING_KEYS);
+    Tcl_InitHashTable (&sdata->elementType, TCL_STRING_KEYS);
     Tcl_InitHashTable (&sdata->prefix, TCL_STRING_KEYS);
     Tcl_InitHashTable (&sdata->pattern, TCL_STRING_KEYS);
     Tcl_InitHashTable (&sdata->attrNames, TCL_STRING_KEYS);
@@ -561,6 +679,8 @@ initSchemaData (
     sdata->unknownIDrefs = 0;
     Tcl_InitHashTable (&sdata->idTables, TCL_STRING_KEYS);
     Tcl_InitHashTable (&sdata->keySpaces, TCL_STRING_KEYS);
+    sdata->choiceHashThreshold = TDOM_CHOICE_HASH_THRESHOLD;
+    sdata->attributeHashThreshold = TDOM_ATTRIBUTE_HASH_THRESHOLD;
     return sdata;
 }
 
@@ -579,7 +699,7 @@ static void schemaInstanceDelete (
     /* Protect the clientData to be freed inside (even nested)
      * Tcl_Eval*() calls to avoid invalid mem access and postpone the
      * cleanup until the Tcl_Eval*() calls are finished (done in
-     * schemaInstanceCmd(). */
+     * tDOM_schemaInstanceCmd()). */
     if (sdata->currentEvals || sdata->inuse > 0) {
         sdata->cleanupAfterUse = 1;
         return;
@@ -596,6 +716,7 @@ static void schemaInstanceDelete (
     }
     Tcl_DeleteHashTable (&sdata->namespace);
     Tcl_DeleteHashTable (&sdata->element);
+    Tcl_DeleteHashTable (&sdata->elementType);
     Tcl_DeleteHashTable (&sdata->prefix);
     Tcl_DeleteHashTable (&sdata->pattern);
     Tcl_DeleteHashTable (&sdata->attrNames);
@@ -658,6 +779,9 @@ static void schemaInstanceDelete (
         FREE (ks);
     }
     Tcl_DeleteHashTable (&sdata->keySpaces);
+    if (sdata->wsbufLen) {
+        FREE (sdata->wsbuf);
+    }
     FREE (sdata);
 }
 
@@ -668,6 +792,7 @@ cleanupLastPattern (
     )
 {
     unsigned int i;
+    char *name;
     Tcl_HashTable *hashTable;
     Tcl_HashEntry *h;
 
@@ -676,17 +801,31 @@ cleanupLastPattern (
     for (i = from; i < sdata->numPatternList; i++) {
         this = sdata->patternList[i];
         hashTable = NULL;
+        name = NULL;
         if (this->type == SCHEMA_CTYPE_NAME) {
-            hashTable = &sdata->element;
+            /* Local defined  elements aren't saved under  their local
+             * name bucket in the sdata->element hash table. */
+            if (this->flags & LOCAL_DEFINED_ELEMENT) {
+                freeSchemaCP (sdata->patternList[i]);
+                continue;
+            }
+            if (this->flags & ELEMENTTYPE_DEF) {
+                hashTable = &sdata->elementType;
+                name = this->typeName;
+            } else {
+                hashTable = &sdata->element;
+                name = this->name;
+            }
         }
         if (this->type == SCHEMA_CTYPE_PATTERN) {
             hashTable = &sdata->pattern;
+            name = this->name;
         }
-        if (this->name && hashTable) {
+        if (name && hashTable) {
             if (this->flags & FORWARD_PATTERN_DEF) {
                 sdata->forwardPatternDefs--;
             }
-            h = Tcl_FindHashEntry (hashTable, this->name);
+            h = Tcl_FindHashEntry (hashTable, name);
             previous = NULL;
             current = Tcl_GetHashValue (h);
             while (current != NULL && current != this) {
@@ -700,7 +839,7 @@ cleanupLastPattern (
                     previous->next = NULL;
                 }
             } else {
-                if (current) {
+                if (current && current->next) {
                     Tcl_SetHashValue (h, current->next);
                 } else {
                     Tcl_DeleteHashEntry (h);
@@ -725,8 +864,14 @@ addToContent (
     SchemaCP *savedCP = NULL;
     unsigned int savedContenSize;
 
+    if (sdata->cp->type == SCHEMA_CTYPE_NAME
+        && sdata->cp->flags & CONSTRAINT_TEXT_CHILD
+        && (pattern->type != SCHEMA_CTYPE_TEXT
+            || pattern->nc == 0)) {
+        sdata->cp->flags &= ~CONSTRAINT_TEXT_CHILD;
+    }
     if (sdata->cp->type == SCHEMA_CTYPE_CHOICE
-         || sdata->cp->type == SCHEMA_CTYPE_INTERLEAVE) {
+        || sdata->cp->type == SCHEMA_CTYPE_INTERLEAVE) {
         if (pattern->type == SCHEMA_CTYPE_CHOICE) {
             if (pattern->flags & MIXED_CONTENT) {
                 sdata->cp->flags |= MIXED_CONTENT;
@@ -843,12 +988,10 @@ repoolStackElement (
 static void
 pushToStack (
     SchemaData *sdata,
-    SchemaCP *pattern,
-    int ac
+    SchemaCP *pattern
     )
 {
     SchemaValidationStack *se, *nextse;
-
     DBG(fprintf(stderr, "push to Stack:\n");serializeCP(pattern));
     if (pattern->type == SCHEMA_CTYPE_NAME && sdata->lastMatchse) {
         se = sdata->lastMatchse;
@@ -900,7 +1043,7 @@ popStack (
         repoolStackElement (sdata, sdata->stack);
         sdata->stack = se;
     } else {
-        if (sdata->stack->activeChild > 0 || sdata->stack->hasMatched) {
+        if (sdata->stack->hasMatched) {
             se = sdata->stack->down;
             sdata->stack->down = sdata->lastMatchse;
             sdata->lastMatchse = sdata->stack;
@@ -953,6 +1096,21 @@ finalizeElement (
     }
 }
 
+static void
+rewindStack (
+    SchemaData *sdata
+    ) 
+{
+    SchemaValidationStack *se;
+
+    while (sdata->lastMatchse) {
+        se = sdata->lastMatchse;
+        sdata->lastMatchse = se->down;
+        se->down = sdata->stack;
+        sdata->stack = se;
+    }
+}
+
 static int 
 recover (
     Tcl_Interp *interp,
@@ -969,6 +1127,7 @@ recover (
     SchemaValidationStack *se;
 
     if (!sdata->reportCmd || sdata->evalError) return 0;
+    if (sdata->recoverFlags & RECOVER_FLAG_DONT_REPORT) return 1;
     /* If non SCHEMA_CTYPE_NAME and the pattern hasn't already matched
      * that's a pattern pushed on stack to look for (probe) if it
      * matches (or allows empty match). Even if the pattern fail it
@@ -986,12 +1145,18 @@ recover (
         interp, cmdPtr,
         Tcl_NewStringObj (ValidationErrorType2str[errorType], -1)
         );
-    sdata->vname = name;
-    sdata->vns = ns;
+    /* In case of unknown element the name/ns arguments of recover()
+     * are NULL, but sdata->vname/sdata->vns are already
+     * pre-filled. */
+    if (name) sdata->vname = name;
+    if (ns) sdata->vns = ns;
     sdata->vtext = text;
     switch (errorType) {
     case DOM_KEYCONSTRAINT:
         sdata->vaction = MATCH_DOM_KEYCONSTRAINT;
+        break;
+    case DOM_XPATH_BOOLEAN:
+        sdata->vaction = MATCH_DOM_XPATH_BOOLEAN;
         break;
     case MISSING_ATTRIBUTE:
     case UNKNOWN_ATTRIBUTE:
@@ -1016,7 +1181,7 @@ recover (
         }
         sdata->vaction = MATCH_ELEMENT_END;
         break;
-    case MISSING_ELEMENT_MATCH_TEXT:
+    case UNEXPECTED_TEXT:
         sdata->vaction = MATCH_TEXT;
         break;
     case INVALID_KEYREF_MATCH_TEXT:
@@ -1043,9 +1208,9 @@ recover (
     rc = Tcl_EvalObjEx (interp, cmdPtr,
                         TCL_EVAL_GLOBAL | TCL_EVAL_DIRECT);
     sdata->currentEvals--;
-    sdata->vaction = MATCH_GLOBAL;
-    sdata->vname = NULL;
-    sdata->vns = NULL;
+    sdata->vaction = 0;
+    if (name) sdata->vname = name;
+    if (ns) sdata->vns = ns;
     sdata->vtext = NULL;
     Tcl_DecrRefCount (cmdPtr);
     if (rc != TCL_OK) {
@@ -1054,18 +1219,45 @@ recover (
     }
     switch (errorType) {
     case MISSING_ELEMENT_MATCH_START:
-        finalizeElement (sdata, ac+1);
-        sdata->skipDeep = 2;
+        if (strcmp (Tcl_GetStringResult (interp), "ignore") == 0) {
+            sdata->recoverFlags |= RECOVER_FLAG_IGNORE;
+            return 1;
+        } else if (strcmp (Tcl_GetStringResult (interp), "vanish") == 0) {
+            sdata->recoverFlags |= RECOVER_FLAG_REWIND;
+            sdata->skipDeep = 1;
+            return 1;
+        } else {
+            /* Rewind stack to last match and ignore the just opened
+             * Element. */
+           finalizeElement (sdata, ac+1);
+            sdata->skipDeep = 2;
+        }
         break;
     case UNEXPECTED_ELEMENT:
-        sdata->skipDeep = 1;
+        if (strcmp (Tcl_GetStringResult (interp), "vanish") == 0) {
+            sdata->recoverFlags |= RECOVER_FLAG_REWIND;
+            sdata->skipDeep = 1;
+            return 1;
+        } else {
+            finalizeElement (sdata, ac+1);
+            sdata->skipDeep = 2;
+        }
+        break;
+    case UNEXPECTED_TEXT:
+        sdata->recoverFlags |= RECOVER_FLAG_REWIND;
+        break;
+    case MISSING_ELEMENT_MATCH_END:
+    case MISSING_TEXT_MATCH_END:
+        if (strcmp (Tcl_GetStringResult (interp), "ignore") == 0) {
+            sdata->recoverFlags |= RECOVER_FLAG_MATCH_END_CONTINUE;
+        } else {
+            sdata->recoverFlags |= RECOVER_FLAG_DONT_REPORT;
+        }
         break;        
     case DOM_KEYCONSTRAINT:
+    case DOM_XPATH_BOOLEAN:
     case MISSING_ATTRIBUTE:
-    case MISSING_ELEMENT_MATCH_END:
-    case MISSING_ELEMENT_MATCH_TEXT:
     case MISSING_TEXT_MATCH_START:
-    case MISSING_TEXT_MATCH_END:
     case UNEXPECTED_ROOT_ELEMENT:
     case UNKNOWN_ATTRIBUTE:
     case INVALID_KEYREF_MATCH_START:
@@ -1116,7 +1308,6 @@ evalVirtual (
     SchemaCP *cp;
 
     cp = sdata->stack->pattern->content[ac];
-    cp->content[cp->nc-1] = (SchemaCP *) sdata->self;
     sdata->currentEvals++;
     rc = Tcl_EvalObjv (interp, cp->nc, (Tcl_Obj **) cp->content,
                        TCL_EVAL_GLOBAL);
@@ -1128,6 +1319,26 @@ evalVirtual (
     return 1;
 }
 
+/* Check, if the pattern to probe does not call itself (even
+ * indirectly) without a match inbetween.*/
+static int inline
+recursivePattern (
+    SchemaValidationStack *se,
+    SchemaCP *pattern
+    )
+{
+    int rc = 0;
+    
+    while (se && se->pattern->type != SCHEMA_CTYPE_NAME) {
+        if (!se->hasMatched && se->pattern == pattern) {
+            rc = 1;
+            break;
+        }
+        se = se->down;
+    }
+    return rc;
+}
+
 static int
 matchElementStart (
     Tcl_Interp *interp,
@@ -1137,9 +1348,10 @@ matchElementStart (
     )
 {
     SchemaCP *cp, *candidate, *icp;
-    int hm, ac, i, mayskip, rc;
+    int hm, ac, i, mayskip, thismayskip, rc;
     int isName = 0;
     SchemaValidationStack *se;
+    Tcl_HashEntry *h;
 
     if (!sdata->stack) return 0;
     se = sdata->stack;
@@ -1172,8 +1384,12 @@ matchElementStart (
                     candidate->namespace != namespace) {
                     break;
                 }
-                updateStack (se, cp, ac);
+                updateStack (sdata, se, ac);
                 sdata->skipDeep = 1;
+                /* See comment in tDOM_probeElement: sdata->vname and
+                 * sdata->vns may be pre-filled. We reset it here.*/
+                sdata->vname = NULL;
+                sdata->vns = NULL;
                 return 1;
 
             case SCHEMA_CTYPE_NAME:
@@ -1182,13 +1398,28 @@ matchElementStart (
                              candidate->name, candidate->namespace));
                 if (candidate->name == name
                     && candidate->namespace == namespace) {
-                    pushToStack (sdata, candidate, ac);
-                    updateStack (se, cp, ac);
+                    pushToStack (sdata, candidate);
+                    updateStack (sdata, se, ac);
                     return 1;
                 }
                 break;
 
             case SCHEMA_CTYPE_CHOICE:
+                if (candidate->typedata) {
+                    h = Tcl_FindHashEntry ((Tcl_HashTable *)candidate->typedata,
+                                           name);
+                    if (h) {
+                        icp = Tcl_GetHashValue (h);
+                        if (icp->namespace == namespace) {
+                            pushToStack (sdata, icp);
+                            updateStack (sdata, se, ac);
+                            return 1;
+                        }
+                    }
+                    /* TODO: Short-cut in case of no match (looking
+                     * for emtpy match, recovering). For now fall
+                     * throu to simple, serial approach. */
+                }
                 for (i = 0; i < candidate->nc; i++) {
                     icp = candidate->content[i];
                     switch (icp->type) {
@@ -1199,15 +1430,20 @@ matchElementStart (
                         if (icp->namespace && icp->namespace != namespace) {
                             break;
                         }
-                        updateStack (se, cp, ac);
+                        updateStack (sdata, se, ac);
                         sdata->skipDeep = 1;
+                        /* See comment in tDOM_probeElement: sdata->vname
+                         * and sdata->vns may be pre-filled. We reset it
+                         * here.*/
+                        sdata->vname = NULL;
+                        sdata->vns = NULL;
                         return 1;
 
                     case SCHEMA_CTYPE_NAME:
                         if (icp->name == name
                             && icp->namespace == namespace) {
-                            pushToStack (sdata, icp, ac);
-                            updateStack (se, cp, ac);
+                            pushToStack (sdata, icp);
+                            updateStack (sdata, se, ac);
                             return 1;
                         }
                         break;
@@ -1215,12 +1451,17 @@ matchElementStart (
                     case SCHEMA_CTYPE_CHOICE:
                         Tcl_Panic ("MIXED or CHOICE child of MIXED or CHOICE");
 
-                    case SCHEMA_CTYPE_INTERLEAVE:
                     case SCHEMA_CTYPE_PATTERN:
-                        pushToStack (sdata, icp, ac);
+                        if (recursivePattern (se, icp)) {
+                            mayskip = 1;
+                            continue;
+                        }
+                        /* fall throu */
+                    case SCHEMA_CTYPE_INTERLEAVE:
+                        pushToStack (sdata, icp);
                         rc = matchElementStart (interp, sdata, name, namespace);
                         if (rc == 1) {
-                            updateStack (se, cp, ac);
+                            updateStack (sdata, se, ac);
                             return 1;
                         }
                         popStack (sdata);
@@ -1247,12 +1488,17 @@ matchElementStart (
                 }
                 else return 0;
 
-            case SCHEMA_CTYPE_INTERLEAVE:
             case SCHEMA_CTYPE_PATTERN:
-                pushToStack (sdata, candidate, ac);
+                if (recursivePattern (se, candidate)) {
+                    mayskip = 1;
+                    break;
+                }
+                /* fall throu */
+            case SCHEMA_CTYPE_INTERLEAVE:
+                pushToStack (sdata, candidate);
                 rc = matchElementStart (interp, sdata, name, namespace);
                 if (rc == 1) {
-                    updateStack (se, cp, ac);
+                    updateStack (sdata, se, ac);
                     return 1;
                 }
                 popStack (sdata);
@@ -1292,8 +1538,11 @@ matchElementStart (
             if (!mayskip && mustMatch (cp->quants[ac], hm)) {
                 if (recover (interp, sdata, MISSING_ELEMENT_MATCH_START, name,
                              namespace, NULL, ac)) {
-                    /* Skip the just opened element tag and the following
-                     * content of the current. */
+                    if (sdata->recoverFlags & RECOVER_FLAG_IGNORE) {
+                        /* We pretend the ac content particle had
+                         * matched. */
+                        updateStack (sdata, se, ac);
+                    }
                     return 1;
                 }
                 return 0;
@@ -1304,8 +1553,6 @@ matchElementStart (
         if (isName) {
             if (recover (interp, sdata, UNEXPECTED_ELEMENT, name, namespace,
                          NULL, 0)) {
-                /* Skip the just opened element tag and the following
-                 * content of the current. */
                 return 1;
             }
             return 0;
@@ -1324,35 +1571,39 @@ matchElementStart (
     case SCHEMA_CTYPE_INTERLEAVE:
         mayskip = 1;
         for (i = 0; i < cp->nc; i++) {
+            thismayskip = 0;
             if (se->interleaveState[i]) {
                 if (maxOne (cp->quants[i])) continue;
-            } else {
-                if (minOne (cp->quants[i])) mayskip = 0;
             }
             icp = cp->content[i];
             switch (icp->type) {
             case SCHEMA_CTYPE_TEXT:
                 if (icp->nc) {
-                    if (!checkText (interp, icp, "")) {
-                        mayskip = 0;
+                    if (checkText (interp, icp, "")) {
+                        thismayskip = 1;
                     }
+                } else {
+                    thismayskip = 1;
                 }
                 break;
 
             case SCHEMA_CTYPE_ANY:
-                if (icp->namespace && icp->namespace == namespace) {
+                if (icp->namespace && icp->namespace != namespace) {
                     break;
                 }
                 sdata->skipDeep = 1;
-                if (mayskip && minOne (cp->quants[i])) mayskip = 0;
                 se->hasMatched = 1;
                 se->interleaveState[i] = 1;
+                /* See comment in tDOM_probeElement: sdata->vname and
+                 * sdata->vns may be pre-filled. We reset it here.*/
+                sdata->vname = NULL;
+                sdata->vns = NULL;
                 return 1;
 
             case SCHEMA_CTYPE_NAME:
                 if (icp->name == name
                     && icp->namespace == namespace) {
-                    pushToStack (sdata, icp, 0);
+                    pushToStack (sdata, icp);
                     se->hasMatched = 1;
                     se->interleaveState[i] = 1;
                     return 1;
@@ -1362,17 +1613,24 @@ matchElementStart (
             case SCHEMA_CTYPE_CHOICE:
                 Tcl_Panic ("MIXED or CHOICE child of INTERLEAVE");
 
-            case SCHEMA_CTYPE_INTERLEAVE:
             case SCHEMA_CTYPE_PATTERN:
-                pushToStack (sdata, icp, 0);
+                if (recursivePattern (se, icp)) {
+                    thismayskip = 1;
+                    break;
+                }
+                /* fall throu */
+            case SCHEMA_CTYPE_INTERLEAVE:
+                pushToStack (sdata, icp);
                 rc = matchElementStart (interp, sdata, name, namespace);
                 if (rc == 1) {
-                    se->hasMatched = 1;
-                    se->interleaveState[i] = 1;
+                    if (!(sdata->recoverFlags & RECOVER_FLAG_REWIND)) {
+                        se->hasMatched = 1;
+                        se->interleaveState[i] = 1;
+                    }
                     return 1;
                 }
                 popStack (sdata);
-                if (mayskip && rc != -1) mayskip = 0;
+                if (rc == -1) thismayskip = 1;
                 break;
 
             case SCHEMA_CTYPE_VIRTUAL:
@@ -1385,10 +1643,23 @@ matchElementStart (
                 break;
 
             }
+            if (!thismayskip && minOne (cp->quants[i])) mayskip = 0;
         }
         if (mayskip) break;
         if (recover (interp, sdata, MISSING_ELEMENT_MATCH_START, name,
                      namespace, NULL, cp->nc)) {
+            if (sdata->recoverFlags & RECOVER_FLAG_IGNORE) {
+                /* We mark the first so far not matched mandatory
+                 * interleave child cp as matched */
+                for (i = 0; i < cp->nc; i++) {
+                    if (!se->interleaveState[i]) {
+                        if (minOne (cp->quants[i])) {
+                            se->interleaveState[i] = 1;
+                            break;
+                        }
+                    }
+                }
+            }
             return 1;
         }
         return 0;
@@ -1418,7 +1689,7 @@ getNamespacePtr (
 }
 
 int
-probeElement (
+tDOM_probeElement (
     Tcl_Interp *interp,
     SchemaData *sdata,
     const char *name,
@@ -1428,7 +1699,7 @@ probeElement (
     Tcl_HashEntry *h;
     void *namespacePtr, *namePtr;
     SchemaCP *pattern;
-    int rc = 1;
+    int rc = 1, reportError;
 
     if (sdata->skipDeep) {
         sdata->skipDeep++;
@@ -1440,7 +1711,7 @@ probeElement (
     }
 
     DBG(
-        fprintf (stderr, "probeElement: look if '%s' in ns '%s' match\n",
+        fprintf (stderr, "tDOM_probeElement: look if '%s' in ns '%s' match\n",
                  name, (char *)namespace);
         );
 
@@ -1460,6 +1731,12 @@ probeElement (
              * will be able to look if there is such a possible any
              * match in the schema. */
             rc = 0;
+            /* If there isn't a matching any cp this is a validation
+             * error. To have the node name/namespace information
+             * available in case of recovering we prefill the sdata
+             * struct here.*/
+            sdata->vname = name;
+            sdata->vns = namespace;
         }
         namespacePtr = NULL;
     }
@@ -1473,6 +1750,8 @@ probeElement (
             namePtr = Tcl_GetHashKey (&sdata->element, h);
         } else {
             namePtr = NULL;
+            /* Prefill in case of validation error. See above.  */
+            sdata->vname = name;
         }
     }
     
@@ -1511,22 +1790,24 @@ probeElement (
                 }
             }
         }
-    }
-    if (h) {
-        pattern = (SchemaCP *) Tcl_GetHashValue (h);
-        while (pattern) {
-            if (pattern->namespace == namespacePtr) {
-                break;
+        reportError = 0;
+        if (h) {
+            pattern = (SchemaCP *) Tcl_GetHashValue (h);
+            while (pattern) {
+                if (pattern->namespace == namespacePtr) {
+                    if (pattern->flags & PLACEHOLDER_PATTERN_DEF
+                        || pattern->flags & FORWARD_PATTERN_DEF) {
+                        reportError = 1;
+                    }
+                    break;
+                }
+                pattern = pattern->next;
             }
-            pattern = pattern->next;
+        } else {
+            pattern = NULL;
         }
-    } else {
-        pattern = NULL;
-    }
-
-    if (!sdata->stack) {
         sdata->validationState = VALIDATION_STARTED;
-        if (!pattern) {
+        if (reportError || pattern == NULL) {
             if (recover (interp, sdata, UNKNOWN_ROOT_ELEMENT, name, namespace,
                          NULL, 0)) {
                 sdata->skipDeep = 1;
@@ -1535,23 +1816,40 @@ probeElement (
             SetResult ("Unknown element");
             return TCL_ERROR;
         }
-        pushToStack (sdata, pattern, 0);
+        pushToStack (sdata, pattern);
         return TCL_OK;
     }
 
     /* The normal case: we're inside the tree */
-    rc = matchElementStart (interp, sdata, (char *) namePtr, namespacePtr);
-    while (rc == -1) {
-        popStack (sdata);
-        rc = matchElementStart (interp, sdata, (char *) namePtr, namespacePtr);
-    };
-    if (rc) {
-        DBG(
-            fprintf (stderr, "probeElement: element '%s' match\n", name);
-            serializeStack (sdata);
-            fprintf (stderr, "\n");
-            );
-        return TCL_OK;
+    /* In case of recovering and if the user wants a required cp to be
+     * treated as matched (or in other words: that the validation
+     * engine should ignore the mandatory state of the cp) we unwind
+     * the call stack to have updated stack elements, to be able to
+     * pretend, we have seen the mandatory cp. Now try to match the
+     * open element from this stack state. */
+    while (1) {
+        rc = matchElementStart (interp, sdata, (char *) namePtr,
+                                namespacePtr);
+        while (rc == -1) {
+            popStack (sdata);
+            rc = matchElementStart (interp, sdata, (char *) namePtr,
+                                    namespacePtr);
+        };
+        if (rc) {
+            DBG(
+                fprintf (stderr, "tDOM_probeElement: element '%s' match\n",
+                         name);
+                serializeStack (sdata);
+                fprintf (stderr, "\n");
+                );
+            if (sdata->recoverFlags & RECOVER_FLAG_IGNORE) {
+                sdata->recoverFlags &= ~RECOVER_FLAG_IGNORE;
+                continue;
+            }
+            CHECK_REWIND;
+            return TCL_OK;
+        }
+        break;
     }
     DBG(
         fprintf (stderr, "element '%s' DOESN'T match\n", name);
@@ -1574,14 +1872,39 @@ int probeAttribute (
     const char *name,
     const char *ns,
     char *value,
-    int *isrequiered
+    int *isrequired
     )
 {
     int i;
     SchemaCP *cp;
+    Tcl_HashTable *t;
+    Tcl_HashEntry *h;
+    SchemaAttr *attr;
     
     cp = sdata->stack->pattern;
-    *isrequiered = 0;
+    *isrequired = 0;
+    if (cp->typedata) {
+        t = (Tcl_HashTable *) cp->typedata;
+        h = Tcl_FindHashEntry (t, name);
+        if (!h) return 0;
+        attr = (SchemaAttr *) Tcl_GetHashValue (h);
+        while (attr && attr->namespace != ns) {
+            attr = attr->next;
+        }
+        if (!attr) return 0;
+        if (attr->cp) {
+            if (!checkText (interp, attr->cp, value)) {
+                if (!recover (interp, sdata, INVALID_ATTRIBUTE_VALUE, name,
+                              ns, value, 0)) {
+                    SetResult3V ("Attribute value doesn't match for "
+                                 "attribute '", name , "'");
+                    return 0;
+                }
+            }
+        }
+        if (attr->required) *isrequired = 1;
+        return 1;
+    }
     for (i = 0; i < cp->numAttr; i++) {
         if (cp->attrs[i]->namespace == ns
             && cp->attrs[i]->name == name) {
@@ -1595,14 +1918,14 @@ int probeAttribute (
                     }
                 }
             }
-            if (cp->attrs[i]->required) *isrequiered = 1;
+            if (cp->attrs[i]->required) *isrequired = 1;
             return 1;
         }
     }
     return 0;
 }
     
-int probeAttributes (
+int tDOM_probeAttributes (
     Tcl_Interp *interp,
     SchemaData *sdata,
     const char **attr
@@ -1634,12 +1957,11 @@ int probeAttributes (
         h = Tcl_FindHashEntry (&sdata->attrNames, ln);
         if (!h) goto unknowncleanup;
         ln = Tcl_GetHashKey (&sdata->attrNames, h);
+        ns = NULL;
         if (namespace) {
             h = Tcl_FindHashEntry (&sdata->namespace, namespace);
             if (!h) goto unknowncleanup;
             ns = Tcl_GetHashKey (&sdata->namespace, h);
-        } else {
-            ns = NULL;
         }
         found = probeAttribute (interp, sdata, ln, ns, atPtr[1], &req);
         reqAttr += req;
@@ -1647,7 +1969,16 @@ int probeAttributes (
         if (!found) {
             if (!recover (interp, sdata, UNKNOWN_ATTRIBUTE, ln, namespace,
                           NULL, 0)) {
-                SetResult3V ("Unknown attribute \"", atPtr[0], "\"");
+                if (!sdata->evalError) {
+                    if (nsatt) {
+                        SetResult ("Unknown attribute \"");
+                        Tcl_AppendResult (interp, namespace, ":", ln, "\"",
+                                          NULL);
+                    } else {
+                        SetResult3 ("Unknown attribute \"", ln, "\"");
+                    }
+                }
+                if (nsatt) namespace[j] = '\xFF';
                 return TCL_ERROR;
             }
         }
@@ -1662,8 +1993,8 @@ int probeAttributes (
             if (!cp->attrs[i]->required) continue;
             found = 0;
             for (atPtr = (char **) attr; atPtr[0] && atPtr[1]; atPtr += 2) {
+                ln = atPtr[0];
                 if (cp->attrs[i]->namespace) {
-                    ln = atPtr[0];
                     j = 0;
                     while (*ln && *ln != '\xFF') {
                         j++, ln++;
@@ -1682,7 +2013,7 @@ int probeAttributes (
                     }
                     if (nsatt) namespace[j] = '\xFF';
                 }
-                if (strcmp (atPtr[0], cp->attrs[i]->name) == 0) {
+                if (strcmp (ln, cp->attrs[i]->name) == 0) {
                     found = 1;
                     break;
                 }
@@ -1707,7 +2038,7 @@ int probeAttributes (
     return TCL_OK;
 }
 
-int probeDomAttributes (
+int tDOM_probeDomAttributes (
     Tcl_Interp *interp,
     SchemaData *sdata,
     domAttrNode *attr
@@ -1758,14 +2089,14 @@ int probeDomAttributes (
                     if (ns) {
                         SetResult ("Unknown attribute \"");
                         Tcl_AppendResult (interp, ns, ":", atPtr->nodeName,
-                                          "\"");
+                                          "\"", NULL);
                     } else {
                         SetResult3 ("Unknown attribute \"", atPtr->nodeName,
                                     "\"");
                     }
                     sdata->validationState = VALIDATION_ERROR;
-                    return TCL_ERROR;
                 }
+                return TCL_ERROR;
             }
         }
     nextAttr:
@@ -1875,8 +2206,7 @@ int probeEventAttribute (
                           NULL, 0)) {
                 if (ns) {
                     SetResult ("Unknown attribute \"");
-                    Tcl_AppendResult (interp, ns, ":", name,
-                                      "\"");
+                    Tcl_AppendResult (interp, ns, ":", name, "\"", NULL);
                 } else {
                     SetResult3 ("Unknown attribute \"", name, "\"");
                 }
@@ -1892,6 +2222,21 @@ int probeEventAttribute (
     return TCL_OK;
 }
 
+/* Returns either -1, 0, 1, 2
+
+   -1 means a pattern or an interleave ended may end, look further at
+   parents next sibling.
+
+   0 means rewind with validation error.
+
+   1 means element content may end here.
+
+   2 means recovering requested further error reporting about missing childs
+   in the current element. To be able to to answer a [info expected] on
+   the occasion of the next error, we update the stack in this case
+   and let tDOM_probeElementEnd restart checkElementEnd again with this
+   stack state.
+*/
 static int checkElementEnd (
     Tcl_Interp *interp,
     SchemaData *sdata
@@ -1899,7 +2244,7 @@ static int checkElementEnd (
 {
     SchemaValidationStack *se;
     SchemaCP *cp, *ic;
-    int hm, ac, i, mayMiss, rc;
+    int hm, ac, i, thismayskip, mayskip = 0, rc;
     int isName = 0;
 
     DBG(fprintf (stderr, "checkElementEnd:\n");
@@ -1907,10 +2252,14 @@ static int checkElementEnd (
     se = sdata->stack;
     getContext (cp, ac, hm);
 
+    if (cp->type == SCHEMA_CTYPE_INTERLEAVE) {
+        ac = 0; hm = 0; mayskip = 1;
+    }
     switch (cp->type) {
     case SCHEMA_CTYPE_NAME:
         isName = 1;
         /* Fall through */
+    case SCHEMA_CTYPE_INTERLEAVE:
     case SCHEMA_CTYPE_PATTERN:
         if (ac < cp->nc && (hasMatched (cp->quants[ac], hm))) {
             DBG(fprintf (stderr, "ac %d has matched, skiping to next ac\n", ac));
@@ -1919,12 +2268,15 @@ static int checkElementEnd (
         while (ac < cp->nc) {
             DBG(fprintf (stderr, "ac %d hm %d mayMiss: %d\n",
                          ac, hm, mayMiss (cp->quants[ac])));
+            if (se->interleaveState && se->interleaveState[ac]) {
+                ac++; continue;
+            }
             if (mayMiss (cp->quants[ac])) {
                 ac++; continue;
             }
-            
             switch (cp->content[ac]->type) {
             case SCHEMA_CTYPE_KEYSPACE_END:
+                /* Don't happen as INTERLEAVE child */
                 cp->content[ac]->keySpace->active--;
                 if (!cp->content[ac]->keySpace->active) {
                     if (cp->content[ac]->keySpace->unknownIDrefs) {
@@ -1940,6 +2292,7 @@ static int checkElementEnd (
                 break;
 
             case SCHEMA_CTYPE_KEYSPACE:
+                /* Don't happen as INTERLEAVE child */
                 if (!cp->content[ac]->keySpace->active) {
                     Tcl_InitHashTable (&cp->content[ac]->keySpace->ids,
                                        TCL_STRING_KEYS);
@@ -1963,10 +2316,11 @@ static int checkElementEnd (
                 break;
 
             case SCHEMA_CTYPE_CHOICE:
-                mayMiss = 0;
+                /* Don't happen as INTERLEAVE child */
+                thismayskip = 0;
                 for (i = 0; i < cp->content[ac]->nc; i++) {
                     if (mayMiss (cp->content[ac]->quants[i])) {
-                        mayMiss = 1;
+                        thismayskip = 1;
                         break;
                     }
                     ic = cp->content[ac]->content[i];
@@ -1977,18 +2331,23 @@ static int checkElementEnd (
                                 continue;
                             }
                         }
-                        mayMiss = 1;
+                        thismayskip = 1;
                         break;
 
                     case SCHEMA_CTYPE_NAME:
                     case SCHEMA_CTYPE_ANY:
                         continue;
                         
-                    case SCHEMA_CTYPE_INTERLEAVE:
                     case SCHEMA_CTYPE_PATTERN:
-                        pushToStack (sdata, ic, ac);
-                        if (checkElementEnd (interp, sdata)) {
-                            mayMiss = 1;
+                        if (recursivePattern (se, ic)) {
+                            thismayskip = 1;
+                            break;
+                        }
+                        /* fall throu */
+                    case SCHEMA_CTYPE_INTERLEAVE:
+                        pushToStack (sdata, ic);
+                        if (checkElementEnd (interp, sdata) == -1) {
+                            thismayskip = 1;
                         }
                         popStack (sdata);
                         break;
@@ -2000,12 +2359,16 @@ static int checkElementEnd (
                         Tcl_Panic ("Invalid CTYPE in MIXED or CHOICE");
                         
                     }
-                    if (mayMiss) break;
+                    if (thismayskip) break;
                 }
-                if (mayMiss) break;
+                if (thismayskip) break;
                 if (!recover (interp, sdata, MISSING_ELEMENT_MATCH_END, NULL,
                               NULL, NULL, 0)) {
                     return 0;
+                }
+                if (sdata->recoverFlags & RECOVER_FLAG_MATCH_END_CONTINUE) {
+                    updateStack (sdata, se, ac);
+                    return 2;
                 }
                 break;
                 
@@ -2013,27 +2376,54 @@ static int checkElementEnd (
                 if (evalVirtual (interp, sdata, ac)) break;
                 else return 0;
                 
-            case SCHEMA_CTYPE_INTERLEAVE:
             case SCHEMA_CTYPE_PATTERN:
-                pushToStack (sdata, cp->content[ac], ac);
+                if (recursivePattern (se, cp->content[ac])) {
+                    break;
+                }
+                /* fall throu */
+            case SCHEMA_CTYPE_INTERLEAVE:
+                pushToStack (sdata, cp->content[ac]);
                 rc = checkElementEnd (interp, sdata);
-                popStack (sdata);
-                if (rc) break;
-                if (!recover (interp, sdata, MISSING_ELEMENT_MATCH_END, NULL,
-                              NULL, NULL, 0)) {
+                if (rc == 0) {
+                    popStack (sdata);
+                    if (sdata->stack->pattern->type == SCHEMA_CTYPE_NAME
+                        || sdata->stack->activeChild
+                        || sdata->stack->hasMatched) {
+                        if (recover (interp, sdata, MISSING_ELEMENT_MATCH_END,
+                                     NULL, NULL, NULL, 0)) {
+                            if (sdata->recoverFlags &
+                                RECOVER_FLAG_MATCH_END_CONTINUE) {
+                                updateStack (sdata, se, ac);
+                                return 2;
+                            }
+                            break;
+                        }
+                    }
                     return 0;
                 }
+                if (rc == 2) {
+                    updateStack (sdata, se, ac);
+                    return 2;
+                }
+                popStack (sdata);
                 break;
                 
             case SCHEMA_CTYPE_ANY:
             case SCHEMA_CTYPE_NAME:
-                if (recover (interp, sdata, MISSING_ELEMENT_MATCH_END, NULL,
-                             NULL, NULL, 0)) {
+                if (recover (interp, sdata, MISSING_ELEMENT_MATCH_END,
+                             NULL, NULL, NULL, 0)) {
+                    if (sdata->recoverFlags & RECOVER_FLAG_MATCH_END_CONTINUE) {
+                        updateStack (sdata, se, ac);
+                        return 2;
+                    }
                     break;
                 }
                 return 0;
             }
             ac++;
+        }
+        if (se->interleaveState) {
+            if (!mayskip) return 0;
         }
         if (isName) return 1;
         return -1;
@@ -2047,17 +2437,6 @@ static int checkElementEnd (
         /* Never pushed onto stack */
         Tcl_Panic ("Invalid CTYPE onto the validation stack!");
 
-    case SCHEMA_CTYPE_INTERLEAVE:
-        for (i = 0; i < cp->nc; i++) {
-            if (mustMatch (cp->quants[i], se->interleaveState[i])) {
-                if (recover (interp, sdata, MISSING_ELEMENT_MATCH_END, NULL,
-                             NULL, NULL, 0)) {
-                    break;
-                }
-                return 0;
-            }
-        }
-        return -1;
     }
     /* Not reached */
     return 0;
@@ -2128,7 +2507,7 @@ checkDocKeys (
 }
 
 int
-probeElementEnd (
+tDOM_probeElementEnd (
     Tcl_Interp *interp,
     SchemaData *sdata
     )
@@ -2136,8 +2515,8 @@ probeElementEnd (
     int rc;
     
     DBG(if (sdata->stack) {
-        fprintf (stderr, "probeElementEnd: look if current stack top can end "
-                 " name: '%s' deep: %d\n",
+        fprintf (stderr, "tDOM_probeElementEnd: look if current stack top can "
+                 " end name: '%s' deep: %d\n",
                  sdata->stack->pattern->name, getDeep (sdata->stack));
         } else {fprintf (stderr, "stack is NULL\n");}
         );
@@ -2158,32 +2537,40 @@ probeElementEnd (
         return TCL_ERROR;
     }
 
-    rc = checkElementEnd (interp, sdata);
-    while (rc == -1) {
-        popStack (sdata);
+    while (1) {
         rc = checkElementEnd (interp, sdata);
-    }
-    if (rc) {
-        popStack (sdata);
-        if (sdata->stack == NULL) {
-            /* End of the first pattern (the tree root) without error. */
-            /* Check for unknown ID references */
-            if (!checkDocKeys (interp, sdata)) {
-                return TCL_ERROR;
-            }
-            /*  We have successfully finished validation */
-            sdata->validationState = VALIDATION_FINISHED;
+        while (rc == -1) {
+            popStack (sdata);
+            rc = checkElementEnd (interp, sdata);
         }
-        DBG(
-            fprintf(stderr, "probeElementEnd: _CAN_ end here.\n");
-            serializeStack (sdata);
-            );
-        return TCL_OK;
+        sdata->recoverFlags &= ~RECOVER_FLAG_DONT_REPORT;
+        if (rc == 2) {
+            sdata->recoverFlags &= ~RECOVER_FLAG_MATCH_END_CONTINUE;
+            continue;
+        }
+        if (rc == 1) {
+            popStack (sdata);
+            if (sdata->stack == NULL) {
+                /* End of the first pattern (the tree root) without error. */
+                /* Check for unknown ID references */
+                if (!checkDocKeys (interp, sdata)) {
+                    return TCL_ERROR;
+                }
+                /*  We have successfully finished validation */
+                sdata->validationState = VALIDATION_FINISHED;
+            }
+            DBG(
+                fprintf(stderr, "tDOM_probeElementEnd: _CAN_ end here.\n");
+                serializeStack (sdata);
+                );
+            return TCL_OK;
+        }
+        break;
     }
     SetResultV ("Missing mandatory content");
     sdata->validationState = VALIDATION_ERROR;
     DBG(
-        fprintf(stderr, "probeElementEnd: CAN'T end here.\n");
+        fprintf(stderr, "tDOM_probeElementEnd: CAN'T end here.\n");
         serializeStack (sdata);
         );
     return TCL_ERROR;
@@ -2198,13 +2585,13 @@ matchText (
 {
     SchemaCP *cp, *candidate, *ic;
     SchemaValidationStack *se;
-    int ac, hm, isName = 0, i;
+    int ac, hm, isName = 0, i, mayskip;
 
     DBG(fprintf (stderr, "matchText called with text '%s'\n", text));
     
+    se = sdata->stack;
+    getContext (cp, ac, hm);
     while (1) {
-        se = sdata->stack;
-        getContext (cp, ac, hm);
         switch (cp->type) {
         case SCHEMA_CTYPE_NAME:
             isName = 1;
@@ -2215,23 +2602,21 @@ matchText (
                 switch (candidate->type) {
                 case SCHEMA_CTYPE_TEXT:
                     if (checkText (interp, candidate, text)) {
-                        updateStack (se, cp, ac);
+                        updateStack (sdata, se, ac);
                         return 1;
                     }
                     if (sdata->evalError) return 0;
                     if (recover (interp, sdata, INVALID_VALUE, NULL, NULL,
                                  text, ac)) {
-                        updateStack (se, cp, ac);
+                        updateStack (sdata, se, ac);
                         return 1;
-                    } else {
-                        return 0;
                     }
                     SetResult ("Invalid text content");
                     return 0;
 
                 case SCHEMA_CTYPE_CHOICE:
                     if (candidate->flags & MIXED_CONTENT) {
-                        updateStack (se, cp, ac);
+                        updateStack (sdata, se, ac);
                         return 1;
                     }
                     for (i = 0; i < candidate->nc; i++) {
@@ -2239,7 +2624,7 @@ matchText (
                         switch (ic->type) {
                         case SCHEMA_CTYPE_TEXT:
                             if (checkText (interp, ic, text)) {
-                                updateStack (se, cp, ac);
+                                updateStack (sdata, se, ac);
                                 return 1;
                             }
                             break;
@@ -2248,11 +2633,15 @@ matchText (
                         case SCHEMA_CTYPE_ANY:
                             break;
 
-                        case SCHEMA_CTYPE_INTERLEAVE:
                         case SCHEMA_CTYPE_PATTERN:
-                            pushToStack (sdata, ic, ac);
+                            if (recursivePattern (se, ic)) {
+                                break;
+                            }
+                            /* fall throu */
+                        case SCHEMA_CTYPE_INTERLEAVE:
+                            pushToStack (sdata, ic);
                             if (matchText (interp, sdata, text)) {
-                                updateStack (se, cp, ac);
+                                updateStack (sdata, se, ac);
                                 return 1;
                             }
                             popStack (sdata);
@@ -2274,27 +2663,31 @@ matchText (
                         }
                     }
                     if (mustMatch (cp->quants[ac], hm)) {
-                        if (recover (interp, sdata, MISSING_ELEMENT_MATCH_TEXT,
+                        if (recover (interp, sdata, UNEXPECTED_TEXT,
                                      NULL, NULL, text, 0)) {
-                            break;
+                            return 1;
                         }
                         SetResultV ("Unexpected text content");
                         return 0;
                     }
                     break;
 
-                case SCHEMA_CTYPE_INTERLEAVE:
                 case SCHEMA_CTYPE_PATTERN:
-                    pushToStack (sdata, candidate, ac);
+                    if (recursivePattern (se, candidate)) {
+                        break;
+                    }
+                    /* fall throu */
+                case SCHEMA_CTYPE_INTERLEAVE:
+                    pushToStack (sdata, candidate);
                     if (matchText (interp, sdata, text)) {
-                        updateStack (se, cp, ac);
+                        updateStack (sdata, se, ac);
                         return 1;
                     }
                     popStack (sdata);
                     if (mustMatch (cp->quants[ac], hm)) {
-                        if (recover (interp, sdata, MISSING_ELEMENT_MATCH_TEXT,
+                        if (recover (interp, sdata, UNEXPECTED_TEXT,
                                      NULL, NULL, text, 0)) {
-                            break;
+                            return 1;
                         }
                         SetResultV ("Unexpected text content");
                         return 0;
@@ -2334,9 +2727,9 @@ matchText (
                 case SCHEMA_CTYPE_NAME:
                 case SCHEMA_CTYPE_ANY:
                     if (mustMatch (cp->quants[ac], hm)) {
-                        if (recover (interp, sdata, MISSING_ELEMENT_MATCH_TEXT,
+                        if (recover (interp, sdata, UNEXPECTED_TEXT,
                                      NULL, NULL, text, ac)) {
-                            break;
+                            return 1;
                         }
                         SetResultV ("Unexpected text content");
                         return 0;
@@ -2347,7 +2740,7 @@ matchText (
                 ac++;
             }
             if (isName) {
-                if (recover (interp, sdata, MISSING_ELEMENT_MATCH_TEXT, NULL,
+                if (recover (interp, sdata, UNEXPECTED_TEXT, NULL,
                              NULL, text, 0)) {
                     return 1;
                 }
@@ -2355,6 +2748,9 @@ matchText (
                 return 0;
             }
             popStack (sdata);
+            se = sdata->stack;
+            getContext (cp, ac, hm);
+            ac++;
             continue;
 
         case SCHEMA_CTYPE_KEYSPACE:
@@ -2368,13 +2764,21 @@ matchText (
             break;
 
         case SCHEMA_CTYPE_INTERLEAVE:
+            mayskip = 1;
             for (i = 0; i < cp->nc; i++) {
+                if (se->interleaveState[i]) {
+                    if (maxOne (cp->quants[i])) continue;
+                } else {
+                    if (minOne (cp->quants[i])) mayskip = 0;
+                }
                 ic = cp->content[i];
                 switch (ic->type) {
                 case SCHEMA_CTYPE_TEXT:
                     if (checkText (interp, ic, text)) {
-                        se->hasMatched = 1;
-                        se->interleaveState[i] = 1;
+                        if (!(sdata->recoverFlags & RECOVER_FLAG_REWIND)) {
+                            se->hasMatched = 1;
+                            se->interleaveState[i] = 1;
+                        }
                         return 1;
                     }
                     break;
@@ -2383,11 +2787,15 @@ matchText (
                 case SCHEMA_CTYPE_ANY:
                     break;
 
-                case SCHEMA_CTYPE_INTERLEAVE:
                 case SCHEMA_CTYPE_PATTERN:
-                    pushToStack (sdata, ic, 0);
+                    if (recursivePattern (se, ic)) {
+                        break;
+                    }
+                    /* fall throu */
+                case SCHEMA_CTYPE_INTERLEAVE:
+                    pushToStack (sdata, ic);
                     if (matchText (interp, sdata, text)) {
-                        updateStack (se, cp, ac);
+                        updateStack (sdata, se, ac);
                         return 1;
                     }
                     popStack (sdata);
@@ -2405,24 +2813,39 @@ matchText (
                     
                 }
             }
-            break;
+            if (!mayskip) {
+                if (recover (interp, sdata, UNEXPECTED_TEXT, NULL, NULL, text,
+                             ac)) {
+                    return 1;
+                }
+                SetResultV ("Unexpected text content");
+                return 0;
+            }
+            popStack (sdata);
+            se = sdata->stack;
+            getContext (cp, ac, hm);
+            ac++;
+            continue;
         }
+        /* Not reached, but this is inside a while (1) {} loop ...*/
         break;
     }
+    /* Not reached, but at least makes the compiler happy. */
     return 0;
 }
 
 int
-probeText (
+tDOM_probeText (
     Tcl_Interp *interp,
     SchemaData *sdata,
-    char *text
+    char *text,
+    int *only_whites
     )
 {
-    int only_whites;
+    int myonly_whites;
     char *pc;
 
-    DBG(fprintf (stderr, "probeText started, text: '%s'\n", text);)
+    DBG(fprintf (stderr, "tDOM_probeText started, text: '%s'\n", text);)
     if (sdata->skipDeep) {
         return TCL_OK;
     }
@@ -2436,25 +2859,25 @@ probeText (
     }
 
     if (sdata->stack->pattern->flags & CONSTRAINT_TEXT_CHILD) {
+        if (!*text && sdata->stack->pattern->nc == 0) {
+            return TCL_OK;
+        }
         if (matchText (interp, sdata, text)) {
+            CHECK_REWIND;
             return TCL_OK;
         }
     } else {
-        only_whites = 1;
-        pc = text;
-        while (*pc) {
-            if ( (*pc == ' ')  ||
-                 (*pc == '\n') ||
-                 (*pc == '\r') ||
-                 (*pc == '\t') ) {
-                pc++;
-                continue;
-            }
-            only_whites = 0;
-            break;
+        if (only_whites) {
+            myonly_whites = *only_whites;
+        } else {
+            myonly_whites = 1;
+            pc = text;
+            while (SPACE (*pc)) pc++;
+            if (*pc) myonly_whites = 0;
         }
-        if (only_whites)  return TCL_OK;
+        if (myonly_whites)  return TCL_OK;
         if (matchText (interp, sdata, text)) {
+            CHECK_REWIND;
             return TCL_OK;
         }
     }
@@ -2480,8 +2903,8 @@ startElement(
     DBG(fprintf (stderr, "startElement: '%s'\n", name);)
     sdata = vdata->sdata;
     if (!sdata->skipDeep && sdata->stack && Tcl_DStringLength (vdata->cdata)) {
-        if (probeText (vdata->interp, sdata,
-                       Tcl_DStringValue (vdata->cdata)) != TCL_OK) {
+        if (tDOM_probeText (vdata->interp, sdata,
+                       Tcl_DStringValue (vdata->cdata), NULL) != TCL_OK) {
             sdata->validationState = VALIDATION_ERROR;
             XML_StopParser (vdata->parser, 0);
             Tcl_DStringSetLength (vdata->cdata, 0);
@@ -2511,7 +2934,7 @@ startElement(
         s = name;
     }
 
-    if (probeElement (vdata->interp, sdata, s, namespace)
+    if (tDOM_probeElement (vdata->interp, sdata, s, namespace)
         != TCL_OK) {
         sdata->validationState = VALIDATION_ERROR;
         XML_StopParser (vdata->parser, 0);
@@ -2519,7 +2942,7 @@ startElement(
     }
     if (sdata->skipDeep == 0
         && (atts[0] || (sdata->stack && sdata->stack->pattern->attrs))) {
-        if (probeAttributes (vdata->interp, sdata, atts)
+        if (tDOM_probeAttributes (vdata->interp, sdata, atts)
             != TCL_OK) {
             sdata->validationState = VALIDATION_ERROR;
             XML_StopParser (vdata->parser, 0);
@@ -2542,8 +2965,8 @@ endElement (
         return;
     }
     if (!sdata->skipDeep && sdata->stack && Tcl_DStringLength (vdata->cdata)) {
-        if (probeText (vdata->interp, sdata,
-                       Tcl_DStringValue (vdata->cdata)) != TCL_OK) {
+        if (tDOM_probeText (vdata->interp, sdata,
+                       Tcl_DStringValue (vdata->cdata), NULL) != TCL_OK) {
             sdata->validationState = VALIDATION_ERROR;
             XML_StopParser (vdata->parser, 0);
             Tcl_DStringSetLength (vdata->cdata, 0);
@@ -2555,7 +2978,7 @@ endElement (
         Tcl_DStringSetLength (vdata->cdata, 0);
         vdata->onlyWhiteSpace = 1;
     }
-    if (probeElementEnd (vdata->interp, sdata)
+    if (tDOM_probeElementEnd (vdata->interp, sdata)
         != TCL_OK) {
         sdata->validationState = VALIDATION_ERROR;
         XML_StopParser (vdata->parser, 0);
@@ -2644,7 +3067,171 @@ validateString (
     XML_ParserFree (parser);
     Tcl_DStringFree (&cdata);
     FREE (vdata.uri);
-    while (sdata->stack) popStack (sdata);
+    return result;
+}
+
+static int
+validateFile (
+    Tcl_Interp *interp,
+    SchemaData *sdata,
+    Tcl_Obj *filenameObj
+    )
+{
+    XML_Parser parser;
+    char sep = '\xFF';
+    ValidateMethodData vdata;
+    Tcl_DString cdata;
+    Tcl_Obj *resultObj;
+    char sl[50], sc[50];
+    char *filename;
+    int result, fd;
+    Tcl_DString translatedFilename;
+
+    parser = XML_ParserCreate_MM (NULL, MEM_SUITE, &sep);
+    vdata.interp = interp;
+    vdata.sdata = sdata;
+    vdata.parser = parser;
+    sdata->parser = parser;
+    Tcl_DStringInit (&cdata);
+    vdata.cdata = &cdata;
+    vdata.onlyWhiteSpace = 1;
+    vdata.uri = (char *) MALLOC (URI_BUFFER_LEN_INIT);
+    vdata.maxUriLen = URI_BUFFER_LEN_INIT;
+    XML_SetUserData (parser, &vdata);
+    XML_SetElementHandler (parser, startElement, endElement);
+    XML_SetCharacterDataHandler (parser, characterDataHandler);
+
+    filename = Tcl_TranslateFileName (interp, Tcl_GetString (filenameObj),
+                                      &translatedFilename);
+    if (filename == NULL) {
+        result = TCL_ERROR;
+        goto cleanup;
+    }
+    fd = open(filename, O_BINARY|O_RDONLY);
+    if (fd < 0) {
+        Tcl_ResetResult (interp);
+        Tcl_AppendResult (interp, "error opening file \"",
+                          filename, "\"", (char *) NULL);
+        result = TCL_ERROR;
+        goto cleanup;
+    }
+    for (;;) {
+        int nread;
+        char *fbuf = XML_GetBuffer (parser, TDOM_EXPAT_READ_SIZE);
+        if (!fbuf) {
+            close (fd);
+            Tcl_ResetResult (interp);
+            Tcl_SetResult (interp, "Out of memory\n", NULL);
+            result = TCL_ERROR;
+            goto cleanup;
+        }
+        nread = read(fd, fbuf, TDOM_EXPAT_READ_SIZE);
+        if (nread < 0) {
+            close (fd);
+            Tcl_ResetResult (interp);
+            Tcl_AppendResult (interp, "error reading from file \"",
+                              filename, "\"", (char *) NULL);
+            result = TCL_ERROR;
+            goto cleanup;
+        }
+        result = XML_ParseBuffer (parser, nread, nread == 0);
+        if (result != XML_STATUS_OK || !nread
+            || sdata->validationState == VALIDATION_ERROR) {
+            close (fd);
+            break;
+        }
+    }
+    if (result != XML_STATUS_OK
+        || sdata->validationState == VALIDATION_ERROR) {
+        resultObj = Tcl_NewObj ();
+        sprintf(sl, "%ld", XML_GetCurrentLineNumber(parser));
+        sprintf(sc, "%ld", XML_GetCurrentColumnNumber(parser));
+        if (sdata->validationState == VALIDATION_ERROR) {
+            Tcl_AppendStringsToObj (resultObj, "error \"",
+                                    Tcl_GetStringResult (interp),
+                                    "\" at line ", sl, " character ", sc, NULL);
+        } else {
+            Tcl_AppendStringsToObj (resultObj, "error \"",
+                                    XML_ErrorString(XML_GetErrorCode(parser)),
+                                    "\" at line ", sl, " character ", sc, NULL);
+        }
+        Tcl_SetObjResult (interp, resultObj);
+        result = TCL_ERROR;
+    } else {
+        Tcl_DStringFree (&translatedFilename);
+        result = TCL_OK;
+    }
+cleanup:
+    Tcl_DStringFree (&translatedFilename);
+    sdata->parser = NULL;
+    XML_ParserFree (parser);
+    Tcl_DStringFree (&cdata);
+    FREE (vdata.uri);
+    return result;
+}
+
+static int
+validateChannel (
+    Tcl_Interp *interp,
+    SchemaData *sdata,
+    Tcl_Channel channel
+    )
+{
+    XML_Parser parser;
+    char sep = '\xFF';
+    ValidateMethodData vdata;
+    Tcl_DString cdata;
+    Tcl_Obj *resultObj, *bufObj;
+    char sl[50], sc[50], *str;
+    int result = TCL_OK, len, done, tclLen, rc;
+
+    parser = XML_ParserCreate_MM (NULL, MEM_SUITE, &sep);
+    vdata.interp = interp;
+    vdata.sdata = sdata;
+    vdata.parser = parser;
+    sdata->parser = parser;
+    Tcl_DStringInit (&cdata);
+    vdata.cdata = &cdata;
+    vdata.onlyWhiteSpace = 1;
+    vdata.uri = (char *) MALLOC (URI_BUFFER_LEN_INIT);
+    vdata.maxUriLen = URI_BUFFER_LEN_INIT;
+    XML_SetUserData (parser, &vdata);
+    XML_SetElementHandler (parser, startElement, endElement);
+    XML_SetCharacterDataHandler (parser, characterDataHandler);
+
+    bufObj = Tcl_NewObj();
+    Tcl_SetObjLength (bufObj, 6144);
+    do {
+        len = Tcl_ReadChars (channel, bufObj, 1024, 0);
+        done = (len < 1024);
+        str = Tcl_GetStringFromObj(bufObj, &tclLen);
+        rc = XML_Parse (parser, str, tclLen, done);
+        if (rc != XML_STATUS_OK 
+            || sdata->validationState == VALIDATION_ERROR) {
+            resultObj = Tcl_NewObj ();
+            sprintf(sl, "%ld", XML_GetCurrentLineNumber(parser));
+            sprintf(sc, "%ld", XML_GetCurrentColumnNumber(parser));
+            if (sdata->validationState == VALIDATION_ERROR) {
+                Tcl_AppendStringsToObj (resultObj, "error \"",
+                                        Tcl_GetStringResult (interp),
+                                        "\" at line ", sl, " character ", sc,
+                                        NULL);
+            } else {
+                Tcl_AppendStringsToObj (resultObj, "error \"",
+                                        XML_ErrorString(XML_GetErrorCode(parser)),
+                                        "\" at line ", sl, " character ", sc,
+                                        NULL);
+            }
+            Tcl_SetObjResult (interp, resultObj);
+            result = TCL_ERROR;
+            break;
+        }
+    } while (!done);
+    Tcl_DecrRefCount (bufObj);
+    sdata->parser = NULL;
+    XML_ParserFree (parser);
+    Tcl_DStringFree (&cdata);
+    FREE (vdata.uri);
     return result;
 }
 
@@ -2669,9 +3256,10 @@ checkdomKeyConstraints (
     domNode *n;
     domAttrNode *attr;
     int rc, i, j, hnew, len, skip, first;
-    char *errMsg = NULL, *keystr;
+    char *errMsg = NULL, *keystr, *efsv;
     Tcl_HashTable htable;
     Tcl_DString dStr;
+    xpathCBs cbs;
 
     kc = sdata->stack->pattern->domKeys;
     memset (&nodeList, 0, sizeof (xpathResultSet));
@@ -2681,20 +3269,36 @@ checkdomKeyConstraints (
     memset (&frs, 0, sizeof (xpathResultSet));
     frs.type = EmptyResult;
     Tcl_DStringInit (&dStr);
+    xpathRSReset (&nodeList, node);
+    cbs.funcCB         = tcldom_xpathFuncCallBack;
+    cbs.funcClientData = interp;
+    cbs.varCB          = NULL;
+    cbs.varClientData  = NULL;
     while (kc) {
         xpathRSReset (&rs, NULL);
-        xpathRSReset (&nodeList, node);
-        Tcl_InitHashTable (&htable, TCL_STRING_KEYS);
-        rc = xpathEvalAst (kc->selector, &nodeList, node, &rs, &errMsg);
+        rc = xpathEvalAst (kc->selector, &nodeList, node, &cbs, &rs, &errMsg);
         if (rc) {
             SetResult (errMsg);
-            goto errorCleanup;
+            goto booleanErrorCleanup;
+        }
+        if (kc->flags & DKC_FLAG_BOOLEAN) {
+            i = xpathFuncBoolean (&rs);
+            if (!i) {
+                if (!recover (interp, sdata, DOM_XPATH_BOOLEAN, kc->name,
+                              NULL, NULL, 0)) {
+                    SetResultV ("INVALID_DOM_XPATH_BOOLEAN");
+                    goto booleanErrorCleanup;
+                }
+            }
+            kc = kc->next;
+            continue;
         }
         if (rs.type == EmptyResult) goto nextConstraint;
         if (rs.type != xNodeSetResult) {
             SetResult ("INVALID_DOM_KEYCONSTRAINT");
             goto errorCleanup;
         }
+        Tcl_InitHashTable (&htable, TCL_STRING_KEYS);
         for (i = 0; i < rs.nr_nodes; i++) {
             n = rs.nodes[i];
             if (n->nodeType != ELEMENT_NODE) {
@@ -2704,7 +3308,8 @@ checkdomKeyConstraints (
             xpathRSReset (&nodeList, n);
             if (kc->nrFields == 1) {
                 xpathRSReset (&frs, NULL);
-                rc = xpathEvalAst (kc->fields[0], &nodeList, n, &frs, &errMsg);
+                rc = xpathEvalAst (kc->fields[0], &nodeList, n, &cbs, &frs,
+                                   &errMsg);
                 if (rc) {
                     SetResult (errMsg);
                     goto errorCleanup;
@@ -2717,23 +3322,27 @@ checkdomKeyConstraints (
                     if (kc->flags & DKC_FLAG_IGNORE_EMPTY_FIELD_SET) {
                         continue;
                     }
-                    Tcl_CreateHashEntry (&htable, "", &hnew);
+                    efsv = "";
+                    if (kc->emptyFieldSetValue) {
+                        efsv = kc->emptyFieldSetValue;
+                    }
+                    Tcl_CreateHashEntry (&htable, efsv, &hnew);
                     if (!hnew) {
-                        if (recover (interp, sdata, DOM_KEYCONSTRAINT, NULL,
-                                     NULL, NULL, 0)) {
+                        if (recover (interp, sdata, DOM_KEYCONSTRAINT,
+                                     kc->name, NULL, efsv, 0)) {
                             break;
                         }
-                        SetResult ("DOM_KEYCONSTRAINT");
+                        SetResultV ("DOM_KEYCONSTRAINT");
                         goto errorCleanup;
                     }
                     continue;
                 }
                 if (frs.nr_nodes != 1) {
-                    if (recover (interp, sdata, DOM_KEYCONSTRAINT, NULL, NULL,
-                                 NULL, 0)) {
+                    if (recover (interp, sdata, DOM_KEYCONSTRAINT, kc->name,
+                                 NULL, NULL, 0)) {
                         break;
                     }
-                    SetResult ("DOM_KEYCONSTRAINT");
+                    SetResultV ("DOM_KEYCONSTRAINT");
                     goto errorCleanup;
                 }
                 if (frs.nodes[0]->nodeType != ELEMENT_NODE
@@ -2745,25 +3354,27 @@ checkdomKeyConstraints (
                     attr = (domAttrNode *) frs.nodes[0];
                     Tcl_CreateHashEntry (&htable, attr->nodeValue, &hnew);
                     if (!hnew) {
-                        if (recover (interp, sdata, DOM_KEYCONSTRAINT, NULL,
-                                     NULL, NULL, 0)) {
+                        if (recover (interp, sdata, DOM_KEYCONSTRAINT,
+                                     kc->name, NULL, attr->nodeValue, 0)) {
                             break;
                         }
-                        SetResult ("DOM_KEYCONSTRAINT");
+                        SetResultV ("DOM_KEYCONSTRAINT");
                         goto errorCleanup;
                     }
                 } else {
                     keystr = xpathGetStringValue (frs.nodes[0], &len);
                     Tcl_CreateHashEntry (&htable, keystr, &hnew);
-                    FREE(keystr);
                     if (!hnew) {
-                        if (recover (interp, sdata, DOM_KEYCONSTRAINT, NULL,
-                                     NULL, NULL, 0)) {
+                        if (recover (interp, sdata, DOM_KEYCONSTRAINT,
+                                     kc->name, NULL, keystr, 0)) {
+                            FREE(keystr);
                             break;
                         }
-                        SetResult ("DOM_KEYCONSTRAINT");
+                        FREE(keystr);
+                        SetResultV ("DOM_KEYCONSTRAINT");
                         goto errorCleanup;
                     }
+                    FREE(keystr);
                 }
             } else {
                 Tcl_DStringSetLength (&dStr, 0);
@@ -2771,8 +3382,8 @@ checkdomKeyConstraints (
                 first = 1;
                 for (j = 0; j < kc->nrFields; j++) {
                     xpathRSReset (&frs, NULL);
-                    rc = xpathEvalAst (kc->fields[j], &nodeList, n, &frs,
-                                       &errMsg);
+                    rc = xpathEvalAst (kc->fields[j], &nodeList, n, &cbs,
+                                       &frs, &errMsg);
                     if (rc) {
                         SetResult (errMsg);
                         goto errorCleanup;
@@ -2786,17 +3397,24 @@ checkdomKeyConstraints (
                         if (kc->flags & DKC_FLAG_IGNORE_EMPTY_FIELD_SET) {
                             continue;
                         }
-                        if (first) first = 0;
-                        else Tcl_DStringAppend (&dStr, ":", 1);
+                        if (kc->emptyFieldSetValue) {
+                            if (first) first = 0;
+                            else Tcl_DStringAppend (&dStr, ":", 1);
+                            Tcl_DStringAppend (&dStr, kc->emptyFieldSetValue,
+                                               kc->efsv_len);
+                        } else {
+                            if (first) first = 0;
+                            else Tcl_DStringAppend (&dStr, ":", 1);
+                        }
                         continue;
                     }
                     if (frs.nr_nodes != 1) {
-                        if (recover (interp, sdata, DOM_KEYCONSTRAINT, NULL,
-                                     NULL, NULL, 0)) {
+                        if (recover (interp, sdata, DOM_KEYCONSTRAINT,
+                                     kc->name, NULL, NULL, 0)) {
                             skip = 1;
                             break;
                         }
-                        SetResult ("DOM_KEYCONSTRAINT");
+                        SetResultV ("DOM_KEYCONSTRAINT");
                         goto errorCleanup;
                     }
                     if (frs.nodes[0]->nodeType != ELEMENT_NODE
@@ -2813,22 +3431,24 @@ checkdomKeyConstraints (
                     } else {
                         keystr = xpathGetStringValue (frs.nodes[0], &len);
                         Tcl_DStringAppend (&dStr, keystr, len);
+                        FREE (keystr);
                     }
                 }
                 if (skip) break;
                 Tcl_CreateHashEntry (&htable, Tcl_DStringValue (&dStr), &hnew);
                 if (!hnew) {
-                    if (recover (interp, sdata, DOM_KEYCONSTRAINT, NULL, NULL,
-                                 NULL, 0)) {
+                    if (recover (interp, sdata, DOM_KEYCONSTRAINT, 
+                                 kc->name, NULL, Tcl_DStringValue (&dStr),
+                                 0)) {
                         break;
                     }
-                    SetResult ("DOM_KEYCONSTRAINT");
+                    SetResultV ("DOM_KEYCONSTRAINT");
                     goto errorCleanup;
                 }
             }
         }
-    nextConstraint:
         Tcl_DeleteHashTable (&htable);
+    nextConstraint:
         kc = kc->next;
     }
     schemaxpathRSFree (&frs);
@@ -2838,6 +3458,7 @@ checkdomKeyConstraints (
 
 errorCleanup:
     Tcl_DeleteHashTable (&htable);
+booleanErrorCleanup:
     schemaxpathRSFree (&frs);
     schemaxpathRSFree (&rs);
     schemaxpathRSFree (&nodeList);
@@ -2852,6 +3473,7 @@ validateDOM (
     )
 {
     char *ln;
+    domNode *savednode, *savedinsideNode;
 
     if (node->namespace) {
         if (node->ownerDocument->namespaces[node->namespace-1]->prefix[0] == '\0') {
@@ -2871,25 +3493,34 @@ validateDOM (
     } else {
         ln = node->nodeName;
     }
+    savednode = sdata->node;
     sdata->node = node;
-    if (probeElement (interp, sdata, ln,
+    if (tDOM_probeElement (interp, sdata, ln,
                       node->namespace ?
                       node->ownerDocument->namespaces[node->namespace-1]->uri
                       : NULL)
         != TCL_OK) {
         return TCL_ERROR;
     }
+    /* In case of UNKNOWN_ROOT_ELEMENT and reportCmd is set
+     * sdata->stack is NULL. */
+    if (!sdata->stack) return TCL_OK;
     if (sdata->skipDeep == 0) {
         if (node->firstAttr) {
-            if (probeDomAttributes (interp, sdata, node->firstAttr) != TCL_OK) {
+            if (tDOM_probeDomAttributes (interp, sdata, node->firstAttr)
+                != TCL_OK) {
                 return TCL_ERROR;
             }
         } else {
             if (sdata->stack->pattern->numReqAttr) {
-                /* probeDomAttributes fills interp result with a msg which
-                 * required attributes are missing. */
-                probeDomAttributes (interp, sdata, NULL);
-                return TCL_ERROR;
+                /* tDOM_probeDomAttributes fills interp result with a
+                 * msg which required attributes are missing in case
+                 * of no reportCmd. In case of reportCmd
+                 * tDOM_probeDomAttributes() returns only error in the
+                 * case of error in called scripts. */
+                if (tDOM_probeDomAttributes (interp, sdata, NULL) != TCL_OK) {
+                    return TCL_ERROR;
+                }
             }
         }
     }
@@ -2898,14 +3529,16 @@ validateDOM (
         if (checkdomKeyConstraints (interp, sdata, node) != TCL_OK)
             return TCL_ERROR;
     }
-    
+
+    savedinsideNode = sdata->insideNode;
+    sdata->insideNode = node;
     node = node->firstChild;
     while (node) {
         switch (node->nodeType) {
         case ELEMENT_NODE:
             if (Tcl_DStringLength (sdata->cdata)) {
-                if (probeText (interp, sdata,
-                               Tcl_DStringValue (sdata->cdata)) != TCL_OK)
+                if (tDOM_probeText (interp, sdata,
+                               Tcl_DStringValue (sdata->cdata), NULL) != TCL_OK)
                     return TCL_ERROR;
                 Tcl_DStringSetLength (sdata->cdata, 0);
             }
@@ -2919,8 +3552,8 @@ validateDOM (
                 Tcl_DStringAppend (sdata->cdata,
                                    ((domTextNode *) node)->nodeValue,
                                    ((domTextNode *) node)->valueLength);
-                if (probeText (interp, sdata,
-                               Tcl_DStringValue (sdata->cdata)) != TCL_OK) {
+                if (tDOM_probeText (interp, sdata,
+                               Tcl_DStringValue (sdata->cdata), NULL) != TCL_OK) {
                     Tcl_DStringSetLength (sdata->cdata, 0);
                     return TCL_ERROR;
                 }
@@ -2944,11 +3577,13 @@ validateDOM (
         node = node->nextSibling;
     }
     if (Tcl_DStringLength (sdata->cdata)) {
-        if (probeText (interp, sdata, Tcl_DStringValue (sdata->cdata))
-            != TCL_OK) return TCL_ERROR;
+        if (tDOM_probeText (interp, sdata, Tcl_DStringValue (sdata->cdata),
+                            NULL) != TCL_OK) return TCL_ERROR;
         Tcl_DStringSetLength (sdata->cdata, 0);
     }
-    if (probeElementEnd (interp, sdata) != TCL_OK) return TCL_ERROR;
+    if (tDOM_probeElementEnd (interp, sdata) != TCL_OK) return TCL_ERROR;
+    sdata->node = savednode;
+    sdata->insideNode = savedinsideNode;
     return TCL_OK;
 }
 
@@ -2964,10 +3599,14 @@ schemaReset (
 
     while (sdata->stack) popStack (sdata);
     while (sdata->lastMatchse) popFromStack (sdata, &sdata->lastMatchse);
+    sdata->recoverFlags = 0;
     sdata->validationState = VALIDATION_READY;
     sdata->skipDeep = 0;
     sdata->evalError = 0;
     sdata->vaction = 0;
+    sdata->vname = NULL;
+    sdata->vns = NULL;
+    sdata->vtext = NULL;
     Tcl_DStringSetLength (sdata->cdata, 0);
     if (sdata->ids.numEntries) {
         Tcl_DeleteHashTable (&sdata->ids);
@@ -2979,7 +3618,7 @@ schemaReset (
              h != NULL;
              h = Tcl_NextHashEntry (&search)) {
             dk = Tcl_GetHashValue (h);
-            if (&dk->ids.numEntries) {
+            if ((&dk->ids)->numEntries) {
                 Tcl_DeleteHashTable (&dk->ids);
                 Tcl_InitHashTable (&dk->ids, TCL_STRING_KEYS);
                 dk->unknownIDrefs = 0;
@@ -3001,6 +3640,7 @@ schemaReset (
     }
     sdata->parser = NULL;
     sdata->node = NULL;
+    sdata->insideNode = NULL;
 }
 
 void
@@ -3047,9 +3687,6 @@ evalConstraints (
     sdata->isTextConstraint = savedIsTextConstraint;
     sdata->cp = savedCP;
     sdata->contentSize = savedContenSize;
-    if (sdata->cp && !sdata->isAttributeConstaint && cp->nc) {
-        sdata->cp->flags |= CONSTRAINT_TEXT_CHILD;
-    }
     return result;
 }
 
@@ -3064,6 +3701,23 @@ serializeElementName (
 
     rObj = Tcl_NewObj();
     Tcl_ListObjAppendElement (interp, rObj, Tcl_NewStringObj (cp->name, -1));
+    if (cp->namespace) {
+        Tcl_ListObjAppendElement (interp, rObj,
+                                  Tcl_NewStringObj (cp->namespace, -1));
+    }
+    return rObj;
+}
+
+static Tcl_Obj*
+serializeElementTypeName (
+    Tcl_Interp *interp,
+    SchemaCP *cp
+    )
+{
+    Tcl_Obj *rObj;
+
+    rObj = Tcl_NewObj();
+    Tcl_ListObjAppendElement (interp, rObj, Tcl_NewStringObj (cp->typeName, -1));
     if (cp->namespace) {
         Tcl_ListObjAppendElement (interp, rObj,
                                   Tcl_NewStringObj (cp->namespace, -1));
@@ -3123,6 +3777,35 @@ serializeElementEnd (
 
 static void
 definedElements (
+    Tcl_HashTable *htable,
+    Tcl_Interp *interp
+    )
+{
+    Tcl_Obj *rObj, *elmObj;
+    Tcl_HashEntry *h;
+    Tcl_HashSearch search;
+    SchemaCP *cp;
+    
+    rObj = Tcl_GetObjResult (interp);
+    for (h = Tcl_FirstHashEntry (htable, &search);
+         h != NULL;
+         h = Tcl_NextHashEntry (&search)) {
+        cp = (SchemaCP *) Tcl_GetHashValue (h);
+        while (cp) {
+            if (cp->flags & FORWARD_PATTERN_DEF
+                || cp->flags & PLACEHOLDER_PATTERN_DEF) {
+                cp = cp->next;
+                continue;
+            }
+            elmObj = serializeElementName (interp, cp);
+            Tcl_ListObjAppendElement (interp, rObj, elmObj);
+            cp = cp->next;
+        }
+    }
+}
+
+static void
+definedElementtypes (
     SchemaData *sdata,
     Tcl_Interp *interp
     )
@@ -3133,15 +3816,22 @@ definedElements (
     SchemaCP *cp;
     
     rObj = Tcl_GetObjResult (interp);
-    for (h = Tcl_FirstHashEntry (&sdata->element, &search);
+    for (h = Tcl_FirstHashEntry (&sdata->elementType, &search);
          h != NULL;
          h = Tcl_NextHashEntry (&search)) {
         cp = (SchemaCP *) Tcl_GetHashValue (h);
-        if (!cp) continue;
-        if (cp->flags & FORWARD_PATTERN_DEF
-            || cp->flags & PLACEHOLDER_PATTERN_DEF) continue;
-        elmObj = serializeElementName (interp, cp);
-        Tcl_ListObjAppendElement (interp, rObj, elmObj);
+        while (cp) {
+            if (cp->flags & FORWARD_PATTERN_DEF
+                || cp->flags & PLACEHOLDER_PATTERN_DEF) {
+                cp = cp->next;
+                continue;
+            }
+            if (cp->flags & FORWARD_PATTERN_DEF
+                || cp->flags & PLACEHOLDER_PATTERN_DEF) continue;
+            elmObj = serializeElementTypeName (interp, cp);
+            Tcl_ListObjAppendElement (interp, rObj, elmObj);
+            cp = cp->next;
+        }
     }
 }
 
@@ -3151,15 +3841,30 @@ getNextExpectedWorker (
     SchemaValidationStack *se,
     Tcl_Interp *interp,
     Tcl_HashTable *seenCPs,
-    Tcl_Obj *rObj
+    Tcl_Obj *rObj,
+    int expectedFlags
     )
 {
-    int ac, hm, i, hnew, mustMatch, mayskip, rc;
+    int ac, hm, i, hnew, mustMatch, mayskip, rc = 1;
+    int probeMayskip = 0;
     SchemaCP *cp, *ic, *jc;
     SchemaValidationStack *se1;
 
+    if (expectedFlags & EXPECTED_PROBE_MAYSKIP) {
+        probeMayskip = 1;
+    }
     getContext (cp, ac, hm);
-    if (hm && maxOne(cp->quants[ac])) ac++;
+    if ((expectedFlags & EXPECTED_IGNORE_MATCHED
+         || expectedFlags & EXPECTED_ONLY_MANDATORY)
+        && hm) {
+        ac++;
+        hm = 0;
+    } else {
+        if (hm && maxOne(cp->quants[ac])) {
+            ac++;
+            hm = 0;
+        }
+    }
     switch (cp->type) {
     case SCHEMA_CTYPE_INTERLEAVE:
         ac = 0;
@@ -3172,72 +3877,157 @@ getNextExpectedWorker (
                 && se->interleaveState[ac]
                 && maxOne (cp->quants[ac])) {
                 ac++;
+                hm = 0;
+                continue;
+            }
+            if (expectedFlags & EXPECTED_ONLY_MANDATORY
+                && !(mustMatch (cp->quants[ac], hm))) {
+                ac++;
+                hm = 0;
                 continue;
             }
             ic = cp->content[ac];
             mayskip = 0;
             switch (ic->type) {
             case SCHEMA_CTYPE_NAME:
+                if (probeMayskip) break;
                 Tcl_ListObjAppendElement (interp, rObj,
                                           serializeElementName (interp, ic));
                 break;
-            case SCHEMA_CTYPE_INTERLEAVE:
             case SCHEMA_CTYPE_PATTERN:
+                if (recursivePattern (se, ic)) {
+                    break;
+                }
+                /* Fall through */
+            case SCHEMA_CTYPE_INTERLEAVE:
+                if (expectedFlags & EXPECTED_ONLY_MANDATORY
+                    && !se->hasMatched) {
+                    expectedFlags |= EXPECTED_PROBE_MAYSKIP;
+                    se1 = getStackElement (sdata, ic);
+                    mayskip = getNextExpectedWorker (sdata, se1, interp,
+                                                     seenCPs, rObj,
+                                                     expectedFlags);
+                    repoolStackElement (sdata, se1);
+                    if (!probeMayskip) {
+                        expectedFlags &= ~EXPECTED_PROBE_MAYSKIP;
+                    }
+                    if (mayskip) break;
+                }
+                if (probeMayskip) break;
                 Tcl_CreateHashEntry (seenCPs, ic, &hnew);
                 if (hnew) {
                     se1 = getStackElement (sdata, ic);
                     mayskip = getNextExpectedWorker (sdata, se1, interp,
-                                                     seenCPs, rObj);
+                                                     seenCPs, rObj,
+                                                     expectedFlags);
                     repoolStackElement (sdata, se1);
                 }
                 break;
 
             case SCHEMA_CTYPE_ANY:
-                Tcl_ListObjAppendElement (interp, rObj,
-                                          serializeAnyCP (interp, ic));
+                if (probeMayskip) break;
+                if (!(expectedFlags & EXPECTED_ONLY_MANDATORY)
+                    || minOne (cp->quants[ac])) {
+                    Tcl_ListObjAppendElement (interp, rObj,
+                                              serializeAnyCP (interp, ic));
+                }
                 break;
 
             case SCHEMA_CTYPE_TEXT:
-                Tcl_ListObjAppendElement (interp, rObj,
-                                          serializeTextCP (interp, ic));
                 if (ic->nc == 0 || checkText (interp, ic, "")) {
                     mayskip = 1;
+                }
+                if (probeMayskip) break;
+                if (!(expectedFlags & EXPECTED_ONLY_MANDATORY)
+                    || mayskip == 0) {
+                    Tcl_ListObjAppendElement (interp, rObj,
+                                              serializeTextCP (interp, ic));
                 }
                 break;
                 
             case SCHEMA_CTYPE_CHOICE:
+                if (probeMayskip) {
+                    for (i = 0; i < ic->nc; i++) {
+                        if (mayMiss (ic->quants[i])) {
+                            mayskip = 1;
+                            break;
+                        }
+                        jc = ic->content[i];
+                        switch (jc->type) {
+                        case SCHEMA_CTYPE_PATTERN:
+                            if (recursivePattern (se, ic)) {
+                                mayskip = 1;
+                                break;
+                            }
+                            /* fall throu */
+                        case SCHEMA_CTYPE_INTERLEAVE:
+                            se1 = getStackElement (sdata, ic);
+                            mayskip = getNextExpectedWorker (
+                                sdata, se1, interp, seenCPs, rObj,
+                                expectedFlags
+                                );
+                            repoolStackElement (sdata, se1);
+                            break;
+                        case SCHEMA_CTYPE_TEXT:
+                            if (ic->nc == 0 || checkText (interp, ic, "")) {
+                                mayskip = 1;
+                            }
+                            break;
+                        default:
+                            break;
+                        }
+                        if (mayskip) break;
+                    }
+                    break;
+                }
                 if (ic->flags & MIXED_CONTENT) {
-                    Tcl_ListObjAppendElement (interp, rObj,
-                                              serializeTextCP (interp, NULL));
+                    if (!(expectedFlags & EXPECTED_ONLY_MANDATORY)) {
+                        Tcl_ListObjAppendElement (
+                            interp, rObj, serializeTextCP (interp, NULL));
+                    }
                 }
                 for (i = 0; i < ic->nc; i++) {
                     jc = ic->content[i];
                     switch (jc->type) {
                     case SCHEMA_CTYPE_NAME:
-                        Tcl_ListObjAppendElement (
-                            interp, rObj, serializeElementName (interp, jc)
-                            );
+                        if (!(expectedFlags & EXPECTED_ONLY_MANDATORY)
+                            || minOne (cp->quants[i])) {
+                            Tcl_ListObjAppendElement (
+                                interp, rObj, serializeElementName (interp, jc)
+                                );
+                        }
                         break;
-                    case SCHEMA_CTYPE_INTERLEAVE:
                     case SCHEMA_CTYPE_PATTERN:
+                        if (recursivePattern (se, jc)) {
+                            break;
+                        }
+                        /* Fall through */
+                    case SCHEMA_CTYPE_INTERLEAVE:
                         Tcl_CreateHashEntry (seenCPs, jc, &hnew);
                         if (hnew) {
-                            se1 = getStackElement (sdata, ic);
+                            se1 = getStackElement (sdata, jc);
                             mayskip = getNextExpectedWorker (
-                                sdata, se1, interp, seenCPs, rObj
+                                sdata, se1, interp, seenCPs, rObj,
+                                expectedFlags
                                 );
                             repoolStackElement (sdata, se1);
                         }
                         break;
                     case SCHEMA_CTYPE_ANY:
-                        Tcl_ListObjAppendElement (
-                            interp, rObj, serializeAnyCP (interp, jc)
-                            );
+                        if (!(expectedFlags & EXPECTED_ONLY_MANDATORY)
+                            || minOne (cp->quants[i])) {
+                            Tcl_ListObjAppendElement (
+                                interp, rObj, serializeAnyCP (interp, jc)
+                                );
+                        }
                         break;
                     case SCHEMA_CTYPE_TEXT:
-                        Tcl_ListObjAppendElement (
-                            interp, rObj, serializeTextCP (interp, jc)
-                            );
+                        if (!(expectedFlags & EXPECTED_ONLY_MANDATORY)
+                            || minOne (cp->quants[i])) {
+                            Tcl_ListObjAppendElement (
+                                interp, rObj, serializeTextCP (interp, jc)
+                                );
+                        }
                         break;
                     case SCHEMA_CTYPE_CHOICE:
                         Tcl_Panic ("MIXED or CHOICE child of MIXED or CHOICE");
@@ -3257,18 +4047,18 @@ getNextExpectedWorker (
                 break;
             }
             if (cp->type == SCHEMA_CTYPE_INTERLEAVE) {
-                if (minOne(cp->quants[ac])) mustMatch = 1;
+                if (!mustMatch && minOne(cp->quants[ac])) mustMatch = 1;
             } else {
                 if (!mayskip && !hm && minOne (cp->quants[ac])) break;
             }
             ac++;
             hm = 0;
         }
-        rc = 1;
         if (cp->type == SCHEMA_CTYPE_NAME) {
             if (ac == cp->nc) {
                 /* The curently open element can end here, no
-                 * mandatory elements missing */
+                 * mandatory elements missing.
+                 * The element end is always mandatory.*/
                 Tcl_ListObjAppendElement (
                     interp, rObj, serializeElementEnd (interp)
                     );
@@ -3333,7 +4123,8 @@ unifyMatchList (
 static void
 getNextExpected (
     SchemaData *sdata,
-    Tcl_Interp *interp
+    Tcl_Interp *interp,
+    int         expectedFlags
     )
 {
     int remainingLastMatch, count, rc;
@@ -3350,7 +4141,8 @@ getNextExpected (
             remainingLastMatch++;
             se = se->down;
         }
-        while (se && getNextExpectedWorker (sdata, se, interp, &localHash, rObj)) {
+        while (se && getNextExpectedWorker (sdata, se, interp, &localHash, rObj,
+                   expectedFlags)) {
             if (remainingLastMatch) {
                 count = 1;
                 se = sdata->lastMatchse;
@@ -3365,13 +4157,15 @@ getNextExpected (
     
     se = sdata->stack;
     while (se) {
-        rc = getNextExpectedWorker (sdata, se, interp, &localHash, rObj);
+        if (!se->hasMatched && se->pattern->type != SCHEMA_CTYPE_NAME) {
+            se = se->down;
+            continue;
+        }
+        rc = getNextExpectedWorker (sdata, se, interp, &localHash, rObj,
+                                    expectedFlags);
         if (se->pattern->type == SCHEMA_CTYPE_NAME) break;
         se = se->down;
-        if (!rc) {
-            if (mayMiss(se->pattern->quants[se->activeChild])) continue;
-            break;
-        }
+        if (!rc) break;
     }
     Tcl_DeleteHashTable (&localHash);
     Tcl_SetObjResult (interp, unifyMatchList (interp, &localHash, rObj));
@@ -3386,7 +4180,7 @@ schemaInstanceInfoCmd (
     Tcl_Obj *const objv[]
     )
 {
-    int methodIndex;
+    int methodIndex, expectedFlags;
     long line, column;
     Tcl_HashEntry *h;
     SchemaCP *cp;
@@ -3397,19 +4191,21 @@ schemaInstanceInfoCmd (
     static const char *schemaInstanceInfoMethods[] = {
         "validationstate", "vstate", "definedElements", "stack", "toplevel",
         "expected", "definition", "validationaction", "vaction", "line",
-        "column", "domNode", "nrForwardDefinitions", NULL
+        "column", "domNode", "nrForwardDefinitions", "typedefinition",
+        "definedElementtypes", "patterndefinition", "definedPatterns", NULL
     };
     enum schemaInstanceInfoMethod {
         m_validationstate, m_vstate, m_definedElements, m_stack, m_toplevel,
         m_expected, m_definition, m_validationaction, m_vaction, m_line,
-        m_column, m_domNode, m_nrForwardDefinitions
+        m_column, m_domNode, m_nrForwardDefinitions, m_typedefinition,
+        m_definedElementtypes, m_patterndefinition, m_definedPatterns
     };
 
     static const char *schemaInstanceInfoStackMethods[] = {
-        "top", "inside", NULL
+        "top", "inside", "associated", NULL
     };
     enum schemaInstanceInfoStackMethod {
-        m_top, m_inside
+        m_top, m_inside, m_associated
     };
 
     static const char *schemaInstanceInfoVactionMethods[] = {
@@ -3418,7 +4214,15 @@ schemaInstanceInfoCmd (
     enum schemaInstanceInfoVactionMethod {
         m_name, m_namespace, m_text
     };
-    
+
+    static const char *schemaInstanceInfoExpectedOptions[] = {
+        "-ignorematched", "-onlymandatory", NULL
+    };
+    enum schemaInstanceInfoExpectedOption 
+    {
+        o_ignorematched, o_onlymandatory
+    };
+            
     if (objc < 2) {
         Tcl_WrongNumArgs (interp, 1, objv, "subcommand ?arguments?");
         return TCL_ERROR;
@@ -3455,7 +4259,23 @@ schemaInstanceInfoCmd (
             Tcl_WrongNumArgs (interp, 1, objv, "definedElements");
             return TCL_ERROR;
         }
-        definedElements (sdata, interp);
+        definedElements (&sdata->element, interp);
+        break;
+
+    case m_definedPatterns:
+        if (objc != 2) {
+            Tcl_WrongNumArgs (interp, 1, objv, "definedPatterns");
+            return TCL_ERROR;
+        }
+        definedElements (&sdata->pattern, interp);
+        break;
+        
+    case m_definedElementtypes:
+        if (objc != 2) {
+            Tcl_WrongNumArgs (interp, 1, objv, "definedElementtypes");
+            return TCL_ERROR;
+        }
+        definedElementtypes (sdata, interp);
         break;
 
     case m_stack:
@@ -3469,13 +4289,12 @@ schemaInstanceInfoCmd (
             != TCL_OK) {
             return TCL_ERROR;
         }
+        if (!sdata->stack) {
+            return TCL_OK;
+        }
+        se = sdata->stack;
         switch ((enum schemaInstanceInfoStackMethod) methodIndex) {
         case m_inside:
-            if (!sdata->stack) {
-                Tcl_ResetResult (interp);
-                return TCL_OK;
-            }
-            se = sdata->stack;
             rObj = Tcl_NewObj();
             while (se) {
                 if (se->pattern->type == SCHEMA_CTYPE_NAME) {
@@ -3488,16 +4307,18 @@ schemaInstanceInfoCmd (
             return TCL_OK;
             
         case m_top:
-            if (!sdata->stack) {
-                Tcl_ResetResult (interp);
-                return TCL_OK;
-            }
-            se = sdata->stack;
             while (se->pattern->type != SCHEMA_CTYPE_NAME) {
                 se = se->down;
             }
             rObj = serializeElementName (interp, se->pattern);
             Tcl_SetObjResult (interp, rObj);
+            return TCL_OK;
+
+        case m_associated:
+            if (!se->pattern->associated) {
+                return TCL_OK;
+            }
+            Tcl_SetObjResult (interp, se->pattern->associated);
             return TCL_OK;
         }
         
@@ -3518,13 +4339,32 @@ schemaInstanceInfoCmd (
         return TCL_OK;
 
     case m_expected:
-        if (objc != 2) {
-            Tcl_WrongNumArgs (interp, 2, objv, "");
+        if (objc < 2 && objc > 4) {
+            Tcl_WrongNumArgs (interp, 2, objv, "?-ignorematched? ?-onlymandatory?");
             return TCL_ERROR;
         }
         if (sdata->validationState == VALIDATION_ERROR
             || sdata->validationState == VALIDATION_FINISHED) {
             return TCL_OK;
+        }
+        expectedFlags = 0;
+        while (objc > 2) {
+            if (Tcl_GetIndexFromObj (interp, objv[2],
+                                     schemaInstanceInfoExpectedOptions,
+                                     "option", 0, &methodIndex)
+                != TCL_OK) {
+                return TCL_ERROR;
+            }
+            switch ((enum schemaInstanceInfoExpectedOption) methodIndex) {
+            case o_ignorematched:
+                expectedFlags |= EXPECTED_IGNORE_MATCHED;
+                break;
+            case o_onlymandatory:
+                expectedFlags |= EXPECTED_ONLY_MANDATORY;
+                break;
+            }
+            objv++;
+            objc--;
         }
         if (!sdata->stack) {
             if (sdata->start) {
@@ -3533,10 +4373,10 @@ schemaInstanceInfoCmd (
                     Tcl_AppendElement (interp, sdata->startNamespace);
                 }
             } else {
-                definedElements (sdata, interp);
+                definedElements (&sdata->element, interp);
             }
         } else {
-            getNextExpected (sdata, interp);
+            getNextExpected (sdata, interp, expectedFlags);
         }
         break;
         
@@ -3565,6 +4405,75 @@ schemaInstanceInfoCmd (
             return TCL_ERROR;
         }
         Tcl_AppendElement (interp, "defelement");
+        Tcl_AppendElement (interp, cp->name);
+        if (cp->namespace) {
+            Tcl_AppendElement (interp, cp->namespace);
+        }
+        if (cp->defScript) {
+            Tcl_AppendElement (interp, Tcl_GetString (cp->defScript));
+        }
+        break;
+
+    case m_patterndefinition:
+        if (objc < 3 && objc > 4) {
+            Tcl_WrongNumArgs (interp, 1, objv, "name ?namespace?");
+            return TCL_ERROR;
+        }
+        h = Tcl_FindHashEntry (&sdata->pattern, Tcl_GetString (objv[2]));
+        if (!h) {
+            SetResult ("Unknown pattern definition");
+            return TCL_ERROR;
+        }
+        cp = Tcl_GetHashValue (h);
+        ns = NULL;
+        if (objc == 4) {
+            ns = getNamespacePtr (sdata, Tcl_GetString (objv[3]));
+        }
+        while (cp && cp->namespace != ns) {
+            cp = cp->next;
+        }
+        if (!cp
+            || cp->flags & LOCAL_DEFINED_ELEMENT
+            || cp->flags & PLACEHOLDER_PATTERN_DEF) {
+            SetResult ("Unknown pattern definition");
+            return TCL_ERROR;
+        }
+        Tcl_AppendElement (interp, "defpattern");
+        Tcl_AppendElement (interp, cp->name);
+        if (cp->namespace) {
+            Tcl_AppendElement (interp, cp->namespace);
+        }
+        if (cp->defScript) {
+            Tcl_AppendElement (interp, Tcl_GetString (cp->defScript));
+        }
+        break;
+        
+    case m_typedefinition:
+        if (objc < 3 && objc > 4) {
+            Tcl_WrongNumArgs (interp, 1, objv, "name ?namespace?");
+            return TCL_ERROR;
+        }
+        h = Tcl_FindHashEntry (&sdata->elementType, Tcl_GetString (objv[2]));
+        if (!h) {
+            SetResult ("Unknown elementtype definition");
+            return TCL_ERROR;
+        }
+        cp = Tcl_GetHashValue (h);
+        ns = NULL;
+        if (objc == 4) {
+            ns = getNamespacePtr (sdata, Tcl_GetString (objv[3]));
+        }
+        while (cp && cp->namespace != ns) {
+            cp = cp->next;
+        }
+        if (!cp
+            || cp->flags & LOCAL_DEFINED_ELEMENT
+            || cp->flags & PLACEHOLDER_PATTERN_DEF) {
+            SetResult ("Unknown elementtype definition");
+            return TCL_ERROR;
+        }
+        Tcl_AppendElement (interp, "defelementtype");
+        Tcl_AppendElement (interp, cp->typeName);
         Tcl_AppendElement (interp, cp->name);
         if (cp->namespace) {
             Tcl_AppendElement (interp, cp->namespace);
@@ -3630,8 +4539,17 @@ schemaInstanceInfoCmd (
 
     case m_domNode:
         if (!sdata->node) break;
-        return tcldom_setInterpAndReturnVar (interp, sdata->node, 0, NULL);
-
+        /* We distinguish between calls from reportCmd and others
+         * (from scripts called with the tcl cmd). */
+        if (sdata->vaction) {
+            /* This is the case: called from reportCmd. */
+            return tcldom_setInterpAndReturnVar (interp, sdata->node, 0, NULL);
+        } else {
+            /* This is the case: called from a with tcl called script. */
+            return tcldom_setInterpAndReturnVar (interp, sdata->insideNode, 0, NULL);
+        }
+        break;
+        
     case m_nrForwardDefinitions:
         if (objc != 2) {
             Tcl_WrongNumArgs(interp, 2, objv, "");
@@ -3644,6 +4562,33 @@ schemaInstanceInfoCmd (
     return TCL_OK;
 }
 
+static void
+attributeLookupPreparation (
+    SchemaData *sdata,
+    SchemaCP   *cp
+    )
+{
+    Tcl_HashTable *t;
+    int i, hnew;
+    Tcl_HashEntry *h;
+    SchemaAttr *attr;
+    
+    if (cp->numAttr <= sdata->attributeHashThreshold) return;
+    t = TMALLOC (Tcl_HashTable);
+    Tcl_InitHashTable (t, TCL_STRING_KEYS);
+    for (i = 0; i < cp->numAttr; i++) {
+        h = Tcl_CreateHashEntry (t, cp->attrs[i]->name, &hnew);
+        if (hnew) {
+            Tcl_SetHashValue (h, cp->attrs[i]);
+        } else {
+            attr = (SchemaAttr *) Tcl_GetHashValue (h);
+            cp->attrs[i]->next = attr->next;
+            attr->next = cp->attrs[i];
+        }
+    }
+    cp->typedata = (void *)t;
+}
+
 /* This implements the script interface to the created schema commands.
 
    Since validation may call out to tcl scripts those scripts may
@@ -3654,57 +4599,68 @@ schemaInstanceInfoCmd (
    After any code by this function that may have called out to a tcl
    script it is important not to return locally but to signal the
    return value with the result variable and ensure to reach the code
-   at the end of schemaInstanceCmd.
+   at the end of tDOM_schemaInstanceCmd.
  */
 int
-schemaInstanceCmd (
+tDOM_schemaInstanceCmd (
     ClientData clientData,
     Tcl_Interp *interp,
     int objc,
     Tcl_Obj *const objv[]
     )
 {
-    int            methodIndex, keywordIndex, hnew, patternIndex;
-    int            result = TCL_OK, forwardDef = 0, i = 0, j;
-    int            savedDefineToplevel, type, len;
+    int            methodIndex, keywordIndex, hnew, hnew1, patternIndex;
+    int            result = TCL_OK, forwardDef = 0, i = 0, j, mode;
+    int            savedDefineToplevel, type, len, n;
     unsigned int   savedNumPatternList;
     SchemaData    *savedsdata = NULL, *sdata = (SchemaData *) clientData;
     Tcl_HashTable *hashTable;
     Tcl_HashEntry *h, *h1;
-    SchemaCP      *pattern, *current = NULL;
+    SchemaCP      *pattern, *thiscp, *current = NULL;
     void          *namespacePtr, *savedNamespacePtr;
     char          *xmlstr, *errMsg;
     domDocument   *doc;
     domNode       *node;
     Tcl_Obj       *attData;
+    Tcl_Channel  chan = NULL;
 
     static const char *schemaInstanceMethods[] = {
-        "defelement", "defpattern", "start",    "event",       "delete",
-        "reset",      "define",     "validate", "domvalidate", "deftext",
-        "info",       "reportcmd",  "prefixns",  NULL
+        "defelement", "defpattern", "start",    "event",        "delete",
+        "reset",      "define",     "validate", "domvalidate",  "deftexttype",
+        "info",       "reportcmd",  "prefixns", "validatefile",
+        "validatechannel",          "defelementtype",           "set",
+        NULL
     };
     enum schemaInstanceMethod {
-        m_defelement, m_defpattern, m_start,    m_event,       m_delete,
-        m_reset,      m_define,     m_validate, m_domvalidate, m_deftext,
-        m_info,       m_reportcmd,  m_prefixns
+        m_defelement, m_defpattern, m_start,    m_event,        m_delete,
+        m_reset,      m_define,     m_validate, m_domvalidate,  m_deftexttype,
+        m_info,       m_reportcmd,  m_prefixns, m_validatefile,
+        m_validatechannel,          m_defelementtype,           m_set
     };
 
     static const char *eventKeywords[] = {
         "start", "end", "text", NULL
     };
-
     enum eventKeyword
     {
         k_elementstart, k_elementend, k_text
     };
 
+    static const char *setKeywords[] = {
+        "choiceHashThreshold", "attributeHashThreshold", NULL
+    };
+    enum setKeyword
+    {
+        s_choiceHashThreshold, s_attributeHashThreshold
+    };
+        
     if (sdata == NULL) {
-        /* Inline defined defelement, defpattern, deftext, start or
-         * prefixns */
+        /* Inline defined defelement, defelementtype, defpattern,
+         * deftexttype, start or prefixns */
         sdata = GETASI;
         CHECK_SI;
         if (!sdata->defineToplevel && sdata->currentEvals > 1) {
-            SetResult ("Method not allowed in nested schema define script");
+            SetResult ("Command not allowed in nested schema define script");
             return TCL_ERROR;
         }
         i = 1;
@@ -3799,6 +4755,9 @@ schemaInstanceCmd (
         pattern->numAttr = sdata->numAttr;
         pattern->numReqAttr = sdata->numReqAttr;
         if (result == TCL_OK) {
+            if (pattern->numAttr) {
+                attributeLookupPreparation (sdata, pattern);
+            }
             if (forwardDef) {
                 if (pattern->flags & FORWARD_PATTERN_DEF) {
                     sdata->forwardPatternDefs--;
@@ -3809,6 +4768,9 @@ schemaInstanceCmd (
             pattern->defScript = objv[patternIndex];
             Tcl_IncrRefCount (pattern->defScript);
         } else {
+            if (forwardDef) {
+                pattern->nc = 0;
+            }
             cleanupLastPattern (sdata, savedNumPatternList);
         }
         sdata->defineToplevel = savedDefineToplevel;
@@ -3848,7 +4810,7 @@ schemaInstanceCmd (
         SETASI(savedsdata);
         break;
 
-    case m_deftext:
+    case m_deftexttype:
         CHECK_RECURSIVE_CALL
         if (objc !=  4-i) {
             Tcl_WrongNumArgs (interp, 2-i, objv, "<name>"
@@ -3862,17 +4824,16 @@ schemaInstanceCmd (
                        "name");
             return TCL_ERROR;
         }
-        savedsdata = GETASI;
-        if (savedsdata == sdata) {
-            SetResult ("Recursive call of schema command is not allowed");
-            return TCL_ERROR;
-        }
         pattern = initSchemaCP (SCHEMA_CTYPE_CHOICE, NULL, NULL);
         pattern->type = SCHEMA_CTYPE_TEXT;
         REMEMBER_PATTERN (pattern)
         SETASI(sdata);
+        savedDefineToplevel = sdata->defineToplevel;
         result = evalConstraints (interp, sdata, pattern, objv[3-i]);
-        SETASI(savedsdata);
+        sdata->defineToplevel = savedDefineToplevel;
+        if (!savedDefineToplevel) {
+            SETASI(savedsdata);
+        }
         if (result == TCL_OK) {
             Tcl_SetHashValue (h, pattern);
         } else {
@@ -3951,8 +4912,11 @@ schemaInstanceCmd (
                     }
                 }
             }
-            result = probeElement (interp, sdata, Tcl_GetString (objv[3]),
+            result = tDOM_probeElement (interp, sdata, Tcl_GetString (objv[3]),
                                    namespacePtr);
+            /* In case of UNKNOWN_ROOT_ELEMENT and reportCmd is set
+             * sdata->stack is NULL. */
+            if (!sdata->stack) break;
             if (sdata->skipDeep == 0 && result == TCL_OK) {
                 result = probeEventAttribute (interp, sdata, attData, len);
             }
@@ -3963,7 +4927,7 @@ schemaInstanceCmd (
                 Tcl_WrongNumArgs (interp, 3, objv, "No arguments expected.");
                 return TCL_ERROR;
             }
-            result = probeElementEnd (interp, sdata);
+            result = tDOM_probeElementEnd (interp, sdata);
             break;
 
         case k_text:
@@ -3971,7 +4935,7 @@ schemaInstanceCmd (
                 Tcl_WrongNumArgs (interp, 3, objv, "<text>");
                 return TCL_ERROR;
             }
-            result = probeText (interp, sdata, Tcl_GetString (objv[3]));
+            result = tDOM_probeText (interp, sdata, Tcl_GetString (objv[3]), NULL);
             break;
         }
         break;
@@ -4021,6 +4985,69 @@ schemaInstanceCmd (
         schemaReset (sdata);
         break;
 
+    case m_validatefile:
+        CHECK_EVAL
+        if (objc < 3 || objc > 4) {
+            Tcl_WrongNumArgs (interp, 2, objv, "<filename> ?resultVarName?");
+            return TCL_ERROR;
+        }
+        if (sdata->validationState != VALIDATION_READY) {
+            SetResult ("The schema command is busy");
+            return TCL_ERROR;
+        }
+        if (validateFile (interp, sdata, objv[2]) == TCL_OK) {
+            SetBooleanResult (1);
+            if (objc == 4) {
+                Tcl_SetVar (interp, Tcl_GetString (objv[3]), "", 0);
+            }
+        } else {
+            if (objc == 4) {
+                Tcl_SetVar (interp, Tcl_GetString (objv[3]),
+                            Tcl_GetStringResult (interp), 0);
+            }
+            if (sdata->evalError) {
+                 result = TCL_ERROR;
+            } else {
+                SetBooleanResult (0);
+            }
+        }
+        schemaReset (sdata);
+        break;
+
+    case m_validatechannel:
+        CHECK_EVAL
+        if (objc < 3 || objc > 4) {
+            Tcl_WrongNumArgs (interp, 2, objv, "<channel> ?resultVarName?");
+            return TCL_ERROR;
+        }
+        if (sdata->validationState != VALIDATION_READY) {
+            SetResult ("The schema command is busy");
+            return TCL_ERROR;
+        }
+        chan = Tcl_GetChannel(interp, Tcl_GetString (objv[2]), &mode);
+        if (chan == NULL) {
+            SetResult ("The channel argument isn't a tcl channel");
+            return TCL_ERROR;
+        }
+        if (validateChannel (interp, sdata, chan) == TCL_OK) {
+            SetBooleanResult (1);
+            if (objc == 4) {
+                Tcl_SetVar (interp, Tcl_GetString (objv[3]), "", 0);
+            }
+        } else {
+            if (objc == 4) {
+                Tcl_SetVar (interp, Tcl_GetString (objv[3]),
+                            Tcl_GetStringResult (interp), 0);
+            }
+            if (sdata->evalError) {
+                 result = TCL_ERROR;
+            } else {
+                SetBooleanResult (0);
+            }
+        }
+        schemaReset (sdata);
+        break;
+        
     case m_domvalidate:
         CHECK_EVAL
         if (objc < 3 || objc > 4) {
@@ -4039,7 +5066,6 @@ schemaInstanceCmd (
                 return TCL_ERROR;
             }
         }
-        sdata->validationState = VALIDATION_STARTED;
         if (validateDOM (interp, sdata, node) == TCL_OK) {
             SetBooleanResult (1);
             if (objc == 4) {
@@ -4062,6 +5088,14 @@ schemaInstanceCmd (
         break;
 
     case m_reportcmd:
+        if (objc == 2) {
+            if (sdata->reportCmd) {
+                Tcl_SetObjResult (interp, sdata->reportCmd);
+            } else {
+                Tcl_SetObjResult (interp, Tcl_NewObj());
+            }
+            break;
+        }
         if (objc != 3) {
             Tcl_WrongNumArgs (interp, 2, objv, "<tcl-cmd>");
             return TCL_ERROR;
@@ -4069,16 +5103,16 @@ schemaInstanceCmd (
         if (sdata->reportCmd) {
             Tcl_DecrRefCount (sdata->reportCmd);
         }
-        sdata->reportCmd = objv[2];
-        Tcl_IncrRefCount (sdata->reportCmd);
+        if (strlen (Tcl_GetString (objv[2])) == 0) {
+            sdata->reportCmd = NULL;
+        } else {
+            sdata->reportCmd = objv[2];
+            Tcl_IncrRefCount (sdata->reportCmd);
+        }
         break;
 
     case m_prefixns:
         CHECK_RECURSIVE_CALL
-        if (clientData == NULL && !sdata->defineToplevel) {
-            SetResult ("Command only allowed at lop level");
-            return TCL_ERROR;
-        }
         if (objc != 2-i && objc != 3-i) {
             Tcl_WrongNumArgs (interp, 2-i, objv, "?prefixUriList?");
             return TCL_ERROR;
@@ -4104,6 +5138,142 @@ schemaInstanceCmd (
                 }
                 j += 2;
             }
+        }
+        break;
+
+    case m_defelementtype:
+        CHECK_RECURSIVE_CALL
+        if (objc != 5-i && objc != 6-i) {
+            Tcl_WrongNumArgs (interp, 1-i, objv, "<type_name> <name>"
+                 " ?<namespace>? pattern");
+            return TCL_ERROR;
+        }
+        savedNumPatternList = sdata->numPatternList;
+        namespacePtr = NULL;
+        patternIndex = 4-i;
+        if (objc == 6-i) {
+            patternIndex = 5-i;
+            namespacePtr = getNamespacePtr (sdata, Tcl_GetString (objv[4-i]));
+        }
+        h = Tcl_CreateHashEntry (&sdata->elementType , Tcl_GetString (objv[2-i]),
+                                 &hnew);
+        pattern = NULL;
+        if (!hnew) {
+            pattern = (SchemaCP *) Tcl_GetHashValue (h);
+            while (pattern) {
+                if (pattern->namespace == namespacePtr) {
+                    if (pattern->flags & FORWARD_PATTERN_DEF) {
+                        forwardDef = 1;
+                        break;
+                    }
+                    SetResult ("Element type already defined in this "
+                               "namespace");
+                    return TCL_ERROR;
+                }
+                pattern = pattern->next;
+            }
+        }
+        h1 = Tcl_CreateHashEntry (&sdata->element , Tcl_GetString (objv[3-i]),
+                                  &hnew1);
+        if (hnew1) {
+            thiscp = initSchemaCP (SCHEMA_CTYPE_NAME, namespacePtr,
+                                   Tcl_GetString (objv[3-i]));
+            REMEMBER_PATTERN (thiscp);
+            thiscp->flags |= PLACEHOLDER_PATTERN_DEF;
+            Tcl_SetHashValue (h1, thiscp);
+        }
+        if (pattern == NULL) {
+            pattern = initSchemaCP (SCHEMA_CTYPE_NAME, namespacePtr,
+                                    Tcl_GetHashKey (&sdata->element, h1));
+            pattern->flags |= ELEMENTTYPE_DEF;
+            pattern->typeName = Tcl_GetHashKey (&sdata->elementType, h);
+            if (!hnew) {
+                current = (SchemaCP *) Tcl_GetHashValue (h);
+                pattern->next = current;
+            }
+            REMEMBER_PATTERN (pattern);
+            Tcl_SetHashValue (h, pattern);
+        }
+        
+        SETASI(sdata);
+        savedDefineToplevel = sdata->defineToplevel;
+        savedNamespacePtr = sdata->currentNamespace;
+        sdata->defineToplevel = 0;
+        sdata->currentNamespace = namespacePtr;
+        sdata->cp = pattern;
+        sdata->numAttr = 0;
+        sdata->numReqAttr = 0;
+        sdata->currentAttrs = NULL;
+        sdata->contentSize = CONTENT_ARRAY_SIZE_INIT;
+        sdata->evalStub[3] = objv[patternIndex];
+        sdata->currentEvals++;
+        result = Tcl_EvalObjv (interp, 4, sdata->evalStub, TCL_EVAL_GLOBAL);
+        sdata->currentEvals--;
+        sdata->currentNamespace = NULL;
+        pattern->attrs = sdata->currentAttrs;
+        pattern->numAttr = sdata->numAttr;
+        pattern->numReqAttr = sdata->numReqAttr;
+        if (result == TCL_OK) {
+            if (pattern->numAttr) {
+                attributeLookupPreparation (sdata, pattern);
+            }
+            if (forwardDef) {
+                sdata->forwardPatternDefs--;
+                pattern->name = Tcl_GetHashKey (&sdata->element, h1);
+                pattern->flags &= ~FORWARD_PATTERN_DEF;
+            }
+            pattern->defScript = objv[patternIndex];
+            Tcl_IncrRefCount (pattern->defScript);
+        } else {
+            if (forwardDef) {
+                pattern->nc = 0;
+            }
+            cleanupLastPattern (sdata, savedNumPatternList);
+        }
+        sdata->defineToplevel = savedDefineToplevel;
+        sdata->currentNamespace = savedNamespacePtr;
+        if (!savedDefineToplevel) {
+            SETASI(savedsdata);
+        }
+        break;
+            
+    case m_set:
+        if (objc < 3 || objc > 4) {
+            Tcl_WrongNumArgs (interp, 2, objv, "setting ?value?");
+            return TCL_ERROR;
+        }        
+        if (Tcl_GetIndexFromObj (interp, objv[2], setKeywords,
+                                 "setting", 0, &keywordIndex)
+            != TCL_OK) {
+            return TCL_ERROR;
+        }
+        switch ((enum setKeyword) keywordIndex) {
+        case s_choiceHashThreshold:
+            if (objc == 4) {
+                if (Tcl_GetIntFromObj (interp, objv[3], &n) != TCL_OK) {
+                    SetResult ("Invalid threshold value");
+                    return TCL_ERROR;
+                }
+                if (n < 0) {
+                    SetResult ("Invalid threshold value");
+                    return TCL_ERROR;
+                }
+                sdata->choiceHashThreshold = n;
+            }
+            SetIntResult (sdata->choiceHashThreshold);
+        case s_attributeHashThreshold:
+            if (objc == 4) {
+                if (Tcl_GetIntFromObj (interp, objv[3], &n) != TCL_OK) {
+                    SetResult ("Invalid threshold value");
+                    return TCL_ERROR;
+                }
+                if (n < 0) {
+                    SetResult ("Invalid threshold value");
+                    return TCL_ERROR;
+                }
+                sdata->attributeHashThreshold = n;
+            }
+            SetIntResult (sdata->attributeHashThreshold);
         }
         break;
         
@@ -4178,7 +5348,7 @@ tDOM_SchemaObjCmd (
     case m_create:
         sdata = initSchemaData (objv[ind]);
         Tcl_CreateObjCommand (interp, Tcl_GetString(objv[ind]),
-                              schemaInstanceCmd,
+                              tDOM_schemaInstanceCmd,
                               (ClientData) sdata,
                               schemaInstanceDelete);
         Tcl_SetObjResult (interp, objv[ind]);
@@ -4296,6 +5466,7 @@ AnyPatternObjCmd (
     checkNrArgs (1,3,"?namespace? ?quant?");
     if (objc == 1) {
         quant = SCHEMA_CQUANT_ONE;
+        n = 0; m = 0;
     } else if (objc == 2) {    
         quant = getQuant (interp, sdata, objv[1], &n, &m);
         if (quant == SCHEMA_CQUANT_ERROR) {
@@ -4330,7 +5501,9 @@ evalDefinition (
     SchemaAttr **savedCurrentAttrs;
     unsigned int savedContenSize;
     unsigned int savedAttrSize, savedNumAttr, savedNumReqAttr;
-    int result, i;
+    int result, i, onlyName, hnew;
+    Tcl_HashEntry *h;
+    Tcl_HashTable *t;
 
     /* Save some state of sdata .. */
     savedCP = sdata->cp;
@@ -4362,24 +5535,55 @@ evalDefinition (
     sdata->currentAttrs = savedCurrentAttrs;
     sdata->attrSize = savedAttrSize;
 
-    if (result == TCL_OK) {
-        REMEMBER_PATTERN (pattern);
+    if (result != TCL_OK) {
+        freeSchemaCP (pattern);
+        return result;
+    }
+
+    REMEMBER_PATTERN (pattern);
+    if (pattern->numAttr) {
+        attributeLookupPreparation (sdata, pattern);
+    }
+    if (pattern->type == SCHEMA_CTYPE_CHOICE) {
+        onlyName = 1;
         for (i = 0; i < pattern->nc; i++) {
-            if (pattern->content[i]->type == SCHEMA_CTYPE_PATTERN) {
-                if (pattern->content[i]->flags & CONSTRAINT_TEXT_CHILD) {
-                    pattern->flags |= CONSTRAINT_TEXT_CHILD;
-                    break;
-                }
+            if (pattern->content[i]->type != SCHEMA_CTYPE_NAME
+                && pattern->content[i]->type != SCHEMA_CTYPE_TEXT) {
+                onlyName = 0;
+                break;
             }
         }
-        addToContent (sdata, pattern, quant, n, m);
-    } else {
-        freeSchemaCP (pattern);
+        if (onlyName && pattern->nc > sdata->choiceHashThreshold) {
+            t =  TMALLOC (Tcl_HashTable);
+            Tcl_InitHashTable (t, TCL_ONE_WORD_KEYS);
+            hnew = 1;
+            for (i = 0; i < pattern->nc; i++) {
+                if (pattern->content[i]->type != SCHEMA_CTYPE_NAME) {
+                    continue;
+                }
+                h = Tcl_CreateHashEntry (t, pattern->content[i]->name, &hnew);
+                if (!hnew) {
+                    break;
+                }
+                Tcl_SetHashValue (h, pattern->content[i]);
+            }
+            if (hnew) {
+                pattern->typedata = (void *)t;
+            } else {
+                /* No simple lookup possible because of more than one
+                 * element with the same local name belong to the
+                 * choices. Rewind. */
+                Tcl_DeleteHashTable (t);
+                FREE (t);
+            }
+        }
     }
-    return result;
+    addToContent (sdata, pattern, quant, n, m);
+    return TCL_OK;
 }
 
-/* Implements the schema definition commands "element" and "ref" */
+/* Implements the schema definition commands "element", "elementtype"
+ * and "ref" */
 static int
 NamedPatternObjCmd (
     ClientData clientData,
@@ -4398,11 +5602,17 @@ NamedPatternObjCmd (
 
     CHECK_SI
     CHECK_TOPLEVEL
-    if (patternType == SCHEMA_CTYPE_NAME) {
+    if (clientData == 0) {
         checkNrArgs (2,4,"Expected: elementName ?quant? ?pattern?");
+        patternType = SCHEMA_CTYPE_NAME;
         hashTable = &sdata->element;
+    } else if (clientData == (ClientData) 1) {
+        checkNrArgs (2,3,"Expected: elementtypeName ?quant?");
+        patternType = SCHEMA_CTYPE_NAME;
+        hashTable = &sdata->elementType;            
     } else {
         checkNrArgs (2,3,"Expected: patternName ?quant?");
+        patternType = SCHEMA_CTYPE_PATTERN;
         hashTable = &sdata->pattern;
     }
 
@@ -4412,7 +5622,7 @@ NamedPatternObjCmd (
     }
     h = Tcl_CreateHashEntry (hashTable, Tcl_GetString(objv[1]), &hnew);
     if (objc < 4) {
-        /* Reference to an element or pattern */
+        /* Reference to an element, elementtype or pattern */
         if (!hnew) {
             pattern = (SchemaCP *) Tcl_GetHashValue (h);
             while (pattern) {
@@ -4428,6 +5638,11 @@ NamedPatternObjCmd (
                 sdata->currentNamespace,
                 Tcl_GetHashKey (hashTable, h)
                 );
+            if (clientData == (ClientData) 1) {
+                pattern->typeName = pattern->name;
+                pattern->name = NULL;
+                pattern->flags |= ELEMENTTYPE_DEF;
+            }
             pattern->flags |= FORWARD_PATTERN_DEF;
             sdata->forwardPatternDefs++;
             if (!hnew) {
@@ -4441,7 +5656,7 @@ NamedPatternObjCmd (
     } else {
         /* Local definition of this element */
         if (hnew) {
-            pattern = initSchemaCP (
+            pattern = initSchemaCP(
                 SCHEMA_CTYPE_NAME,
                 sdata->currentNamespace,
                 Tcl_GetHashKey (hashTable, h)
@@ -4544,6 +5759,7 @@ static int maybeAddAttr (
     attr = TMALLOC (SchemaAttr);
     attr->namespace = namespace;
     attr->name = name;
+    attr->next = NULL;
     attr->required = required;
     if (scriptObj) {
         cp = initSchemaCP (SCHEMA_CTYPE_CHOICE, NULL, NULL);
@@ -4696,7 +5912,7 @@ NamespacePatternObjCmd (
 }
 
 static int
-TextPatternObjCmd (
+TextPatternObjCmd  (
     ClientData clientData,
     Tcl_Interp *interp,
     int objc,
@@ -4707,6 +5923,7 @@ TextPatternObjCmd (
     SchemaQuant quant = SCHEMA_CQUANT_OPT;
     SchemaCP *pattern;
     Tcl_HashEntry *h;
+    int result = TCL_OK;
 
     CHECK_SI
     CHECK_TOPLEVEL
@@ -4718,6 +5935,10 @@ TextPatternObjCmd (
         pattern = initSchemaCP (SCHEMA_CTYPE_CHOICE, NULL, NULL);
         pattern->type = SCHEMA_CTYPE_TEXT;
     } else {
+        if (strcmp("type", Tcl_GetString (objv[1])) != 0) {
+            SetResult ("Expected: ?<definition script>? | type <name>");
+            return TCL_ERROR;
+        }
         h = Tcl_FindHashEntry (&sdata->textDef, Tcl_GetString (objv[2]));
         if (!h) {
             SetResult3 ("Unknown text type \"", Tcl_GetString (objv[2]), "\"");
@@ -4725,16 +5946,19 @@ TextPatternObjCmd (
         }
         quant = SCHEMA_CQUANT_ONE;
         pattern = (SchemaCP *) Tcl_GetHashValue (h);
-        sdata->cp->flags |= CONSTRAINT_TEXT_CHILD;
     }
-    if (objc < 3) {
-        REMEMBER_PATTERN (pattern)
-    }
-    addToContent (sdata, pattern, quant, 0, 0);
     if (objc == 2) {
-        return evalConstraints (interp, sdata, pattern, objv[1]);
+        result = evalConstraints (interp, sdata, pattern, objv[1]);
     }
-    return TCL_OK;
+    if (result == TCL_OK) {
+        if (objc < 3) {
+            REMEMBER_PATTERN (pattern)
+        }
+        addToContent (sdata, pattern, quant, 0, 0);
+    } else {
+        freeSchemaCP (pattern);
+    }
+    return result;
 }
 
 static int
@@ -4766,15 +5990,33 @@ VirtualPatternObjCmd (
 
     pattern = initSchemaCP (SCHEMA_CTYPE_VIRTUAL, NULL, NULL);
     REMEMBER_PATTERN (pattern)
-    /* We alloc for one arugment more: the always appended schema
-     * cmd. */
-    pattern->content = MALLOC (sizeof (Tcl_Obj*) * (objc));
-    for (i = 1; i < objc; i++) {
-        pattern->content[i-1] = (SchemaCP *) objv[i];
-        Tcl_IncrRefCount (objv[i]);
+    pattern->content = MALLOC (sizeof (Tcl_Obj*) * (objc-1));
+    for (i = 0; i < objc-1; i++) {
+        pattern->content[i] = (SchemaCP *) objv[i+1];
+        Tcl_IncrRefCount (objv[i+1]);
     }
-    pattern->nc = objc;
+    pattern->nc = objc-1;
     addToContent (sdata, pattern, SCHEMA_CQUANT_ONE, 0, 0);
+    return TCL_OK;
+}
+
+static int
+SelfObjCmd (
+    ClientData clientData,
+    Tcl_Interp *interp,
+    int objc,
+    Tcl_Obj *const objv[]
+    )
+{
+    SchemaData *sdata = GETASI;
+
+    CHECK_SI
+    CHECK_TOPLEVEL
+    if (objc != 1) {
+        SetResult ("No argument expected");
+        return TCL_ERROR;
+    }
+    Tcl_SetObjResult (interp, Tcl_DuplicateObj (sdata->self));
     return TCL_OK;
 }
 
@@ -4789,13 +6031,13 @@ domuniquePatternObjCmd (
     SchemaData *sdata = GETASI;
     ast t;
     char *errMsg = NULL;
-    domKeyConstraint *kc;
-    int i, nrFields, flags = 0, nrFlags;
+    domKeyConstraint *kc, *kc1;
+    int i, nrFields, flags = 0;
     Tcl_Obj *elm;
 
     CHECK_SI
     CHECK_TOPLEVEL
-    checkNrArgs (3, 5, "Expected: <selector> <fieldlist> ?<name>? ?flags?");
+    checkNrArgs (3, 6, "Expected: <selector> <fieldlist> ?<name>? ?\"IGNORE_EMPTY_FIELD_SET\"|(?\"EMPTY_FIELD_SET_VALUE\" <emptyFieldSetValue?)");
     if (sdata->cp->type != SCHEMA_CTYPE_NAME) {
         SetResult ("The domunique schema definition command is only "
                    "allowed as direct child of an element.");
@@ -4805,22 +6047,19 @@ domuniquePatternObjCmd (
         return TCL_ERROR;
     }
     if (nrFields == 0) {
-        SetResult ("Non empty fieldlist arugment expected.");
-        xpathFreeAst (t);
+        SetResult ("Non empty fieldlist argument expected.");
         return TCL_ERROR;
     }
     if (objc == 5) {
-        if (Tcl_ListObjLength (interp, objv[4], &nrFlags) != TCL_OK) {
-            SetResult ("The <flags> argument must be a valid tcl list");
+        if (strcmp (Tcl_GetString (objv[4]), "IGNORE_EMPTY_FIELD_SET") != 0) {
+            SetResult3 ("Unknown flag '", Tcl_GetString (objv[4]), "'");
             return TCL_ERROR;
         }
-        for (i = 0; i < nrFlags; i++) {
-            Tcl_ListObjIndex (interp, objv[4], i, &elm);
-            if (strcmp ("IGNORE_EMPTY_FIELD_SET", Tcl_GetString (elm)) == 0) {
-                flags |= DKC_FLAG_IGNORE_EMPTY_FIELD_SET;
-                continue;
-            }
-            SetResult3 ("Unknown flag '", Tcl_GetString (elm), "'");
+        flags |= DKC_FLAG_IGNORE_EMPTY_FIELD_SET;
+    }
+    if (objc == 6) {
+        if (strcmp (Tcl_GetString (objv[4]), "EMPTY_FIELD_SET_VALUE") != 0) {
+            SetResult3 ("Unknown flag '", Tcl_GetString (objv[4]), "'");
             return TCL_ERROR;
         }
     }
@@ -4831,7 +6070,6 @@ domuniquePatternObjCmd (
         FREE (errMsg);
         return TCL_ERROR;
     }
-
     
     kc = TMALLOC (domKeyConstraint);
     memset (kc, 0, sizeof (domKeyConstraint));
@@ -4840,7 +6078,6 @@ domuniquePatternObjCmd (
     kc->nrFields = nrFields;
     kc->selector = t;
     kc->flags = flags;
-    
     for (i = 0; i < nrFields; i++) {
         Tcl_ListObjIndex (interp, objv[2], i, &elm);
         if (xpathParse (Tcl_GetString (elm), NULL, XPATH_EXPR,
@@ -4853,11 +6090,74 @@ domuniquePatternObjCmd (
         }
         kc->fields[i] = t;
     }
-    if (objc == 4) {
+    if (objc >= 4) {
         kc->name = tdomstrdup (Tcl_GetString (objv[3]));
     }
-    kc->next = sdata->cp->domKeys;
-    sdata->cp->domKeys = kc;
+    if (objc == 6) {
+        kc->emptyFieldSetValue = tdomstrdup (Tcl_GetString (objv[5]));
+        kc->efsv_len = strlen (kc->emptyFieldSetValue);
+    }
+    /* Apppend to end so that the constraints are checked in
+     * definition order */
+    if (sdata->cp->domKeys) {
+        kc1 = sdata->cp->domKeys;
+        while (1) {
+            if (kc1->next) kc1 = kc1->next;
+            else break;
+        }
+        kc1->next = kc;
+    } else {
+        sdata->cp->domKeys = kc;
+    }
+    return TCL_OK;
+}
+
+static int
+domxpathbooleanPatternObjCmd (
+    ClientData clientData,
+    Tcl_Interp *interp,
+    int objc,
+    Tcl_Obj *const objv[]
+    )
+{
+    SchemaData *sdata = GETASI;
+    ast t;
+    char *errMsg = NULL;
+    domKeyConstraint *kc, *kc1;
+
+    CHECK_SI
+    CHECK_TOPLEVEL
+    checkNrArgs (2, 3, "Expected: <selector> ?<name>?");
+    if (sdata->cp->type != SCHEMA_CTYPE_NAME) {
+        SetResult ("The domxpathboolean schema definition command is only "
+                   "allowed as direct child of an element.");
+    }
+    if (xpathParse (Tcl_GetString (objv[1]), NULL, XPATH_EXPR,
+                    sdata->prefixns, NULL, &t, &errMsg) < 0) {
+        SetResult3 ("Error in selector xpath: '", errMsg, "");
+        FREE (errMsg);
+        return TCL_ERROR;
+    }
+
+    kc = TMALLOC (domKeyConstraint);
+    memset (kc, 0, sizeof (domKeyConstraint));
+    kc->selector = t;
+    kc->flags |= DKC_FLAG_BOOLEAN;
+    if (objc == 3) {
+        kc->name = tdomstrdup (Tcl_GetString (objv[2]));
+    }
+    /* Apppend to end so that the constraints are checked in
+     * definition order */
+    if (sdata->cp->domKeys) {
+        kc1 = sdata->cp->domKeys;
+        while (1) {
+            if (kc1->next) kc1 = kc1->next;
+            else break;
+        }
+        kc1->next = kc;
+    } else {
+        sdata->cp->domKeys = kc;
+    }
     return TCL_OK;
 }
 
@@ -4924,6 +6224,38 @@ keyspacePatternObjCmd (
         pattern->keySpace = Tcl_GetHashValue (h);
         addToContent (sdata, pattern, SCHEMA_CQUANT_ONE, 0, 0);
     }
+    return TCL_OK;
+}
+
+static int
+associatePatternObjCmd (
+    ClientData clientData,
+    Tcl_Interp *interp,
+    int objc,
+    Tcl_Obj *const objv[]
+    )
+{
+    SchemaData *sdata = GETASI;
+    
+    CHECK_SI
+    CHECK_TOPLEVEL
+    checkNrArgs (2, 2, "Expected: data");
+    switch (sdata->cp->type) {
+    case SCHEMA_CTYPE_NAME:
+    case SCHEMA_CTYPE_PATTERN:
+    case SCHEMA_CTYPE_INTERLEAVE:
+        break;
+    default:
+        SetResult ("The associate schema definition command is only "
+                   "allowed inside of global or local element, pattern or "
+                   "interleval context");
+        return TCL_ERROR;
+    }
+    if (sdata->cp->associated) {
+        Tcl_DecrRefCount (sdata->cp->associated);
+    }
+    sdata->cp->associated = objv[1];
+    Tcl_IncrRefCount (sdata->cp->associated);
     return TCL_OK;
 }
 
@@ -5042,7 +6374,6 @@ integerTCObjCmd (
     };
 
     CHECK_TI
-    CHECK_TOPLEVEL
     checkNrArgs (1,2,"?xsd|tcl?");
     if (objc == 1) {
         type = t_xsd;
@@ -5132,7 +6463,6 @@ tclTCObjCmd (
     int i;
 
     CHECK_TI
-    CHECK_TOPLEVEL
     if (objc < 2) {
         SetResult ("Expected: tclcmd ?arg arg ...?");
         return TCL_ERROR;
@@ -5185,7 +6515,6 @@ fixedTCObjCmd (
     SchemaConstraint *sc;
 
     CHECK_TI
-    CHECK_TOPLEVEL
     checkNrArgs (2,2,"Expected: <fixed value>");
     ADD_CONSTRAINT (sdata, sc)
     sc->constraint = fixedImpl;
@@ -5233,7 +6562,6 @@ enumerationTCObjCmd (
     Tcl_Obj *value;
 
     CHECK_TI
-    CHECK_TOPLEVEL
     checkNrArgs (2,2,"Expected: <value list>");
     if (Tcl_ListObjLength (interp, objv[1], &len) != TCL_OK) {
         SetResult ("The argument must be a valid tcl list");
@@ -5297,7 +6625,6 @@ matchTCObjCmd (
     SchemaConstraint *sc;
 
     CHECK_TI
-    CHECK_TOPLEVEL
     checkNrArgs (2,3,"Expected: ?-nocase? <match pattern>");
     if (objc == 3) {
         if (strcmp ("-nocase", Tcl_GetString (objv[1])) != 0) {
@@ -5359,7 +6686,6 @@ regexpTCObjCmd (
     SchemaConstraint *sc;
 
     CHECK_TI
-    CHECK_TOPLEVEL
     checkNrArgs (2,2,"Expected: <regexp>");
     /* Compile it as syntax test (plus caches the complied regexp in
      * the internal value) */
@@ -5429,7 +6755,6 @@ nmtokenTCObjCmd (
     SchemaConstraint *sc;
 
     CHECK_TI
-    CHECK_TOPLEVEL
     checkNrArgs (1,1,"No arguments expected");
     ADD_CONSTRAINT (sdata, sc)
     sc->constraint = nmtokenImpl;
@@ -5487,7 +6812,6 @@ nmtokensTCObjCmd (
     SchemaConstraint *sc;
 
     CHECK_TI
-    CHECK_TOPLEVEL
     checkNrArgs (1,1,"No arguments expected");
     ADD_CONSTRAINT (sdata, sc)
     sc->constraint = nmtokensImpl;
@@ -5550,7 +6874,6 @@ numberTCObjCmd (
     };
 
     CHECK_TI
-    CHECK_TOPLEVEL
     checkNrArgs (1,2,"?xsd|tcl?");
     if (objc == 1) {
         type = t_xsd;
@@ -5631,7 +6954,6 @@ booleanTCObjCmd (
     };
     
     CHECK_TI
-    CHECK_TOPLEVEL
     checkNrArgs (1,2,"?xsd|tcl?");
     if (objc == 1) {
         type = t_xsd;
@@ -5660,65 +6982,123 @@ isodateImpl (
     char *text
     )
 {
-    int i, y, m, d, h, min, seenNonzero = 0, timezone = 0;
+    int i, y, m, d, h, min, s, zh, zm, seenNonzero = 0;
 
-    if (*text == '-') {
-        /* A bce date */
-        text++;
-    }
-    for (i = 0; i < 4; i++) {
-        if (*text < '0' || *text > '9') return 0;
-        if (*text != '0') seenNonzero = 1;
-        text++;
-    }
-    while (*text >= '0' && *text <= '9') text++;
-    if (*text != '-') return 0;
-    /* We only need to know the modulo of the year for 4, 100 and 400,
-     * for this the 4 last letters are enough */
-    y = atoi(text-4);
-    /* There isn't a year 0. it's either 0001 or -0001 */
-    if (!seenNonzero) return 0;
-    text++;
-    for (i = 0; i < 2; i++) {
-        if (*text < '0' || *text > '9') return 0;
-        text++;
-    }
-    if (*text != '-') return 0;
-    m = atoi(text-2);
-    if (m < 1 || m > 12) return 0;
-    text++;
-    for (i = 0; i < 2; i++) {
-        if (*text < '0' || *text > '9') return 0;
-        text++;
-    }
-    if (*text != '\0') timezone = 1;
-    d = atoi(text-2);
-    if (d < 1) return 0;
-    switch (m) {
-    case 1:
-    case 3:
-    case 5:
-    case 7:
-    case 8:
-    case 10:
-    case 12:
-        if (d > 31) return 0;
-        break;
-    case 4:
-    case 6:
-    case 9:
-    case 11:
-        if (d > 30) return 0;
-        break;
-    case 2:
-        if (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) {
-            if (d > 29) return 0;
-        } else {
-            if (d > 28) return 0;
+    if (constraintData < (void *)2) {
+        if (*text == '-') {
+            /* A bce date */
+            text++;
         }
-        break;
+        i = 1;
+        /* Parse year */
+        while (*text >= '0' && *text <= '9') {
+            if (*text > '0' && !seenNonzero) seenNonzero = i;
+            text++;
+            i++;
+        }
+        /* Premature end */
+        if (i < 5) return 0;
+        if (i > 5) {
+            /* The year has more than 4 digits. Only allowed if in fact
+             * needed (no extra leading zeros). */
+            if (seenNonzero > 1) return 0;
+        }
+        if (*text != '-') return 0;
+        /* We only need to know the modulo of the year for 4, 100 and 400,
+         * for this the 4 last letters are enough */
+        y = atoi(text-4);
+        /* There isn't a year 0. it's either 0001 or -0001 */
+        if (!seenNonzero) return 0;
+        text++;
+        /* Parse month */
+        for (i = 0; i < 2; i++) {
+            if (*text < '0' || *text > '9') return 0;
+            text++;
+        }
+        if (*text != '-') return 0;
+        m = atoi(text-2);
+        if (m < 1 || m > 12) return 0;
+        text++;
+        /* Parse day */
+        for (i = 0; i < 2; i++) {
+            if (*text < '0' || *text > '9') return 0;
+            text++;
+        }
+        d = atoi(text-2);
+        if (d < 1) return 0;
+        switch (m) {
+        case 1:
+        case 3:
+        case 5:
+        case 7:
+        case 8:
+        case 10:
+        case 12:
+            if (d > 31) return 0;
+            break;
+        case 4:
+        case 6:
+        case 9:
+        case 11:
+            if (d > 30) return 0;
+            break;
+        case 2:
+            if (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) {
+                if (d > 29) return 0;
+            } else {
+                if (d > 28) return 0;
+            }
+            break;
+        }
     }
-    if (!timezone) return 1;
+    /* Date part end */
+    if (constraintData) {
+        if (constraintData == (void *)1) {
+            /* Time part starts */
+            if (*text != 'T') return 0;
+            text++;
+        }
+        /* Parse hour part */
+        if (*text < '0' || *text > '9') return 0;
+        h = (*text - 48) * 10;
+        text++;
+        if (*text < '0' || *text > '9') return 0;
+        h += (*text - 48);
+        if (h > 24) return 0;
+        text++;
+        if (*text != ':') return 0;
+        text++;
+        /* Parse minute part */
+        if (*text < '0' || *text > '9') return 0;
+        min = (*text - 48) * 10;
+        text++;
+        if (*text < '0' || *text > '9') return 0;
+        min += (*text - 48);
+        if (min > 59) return 0;
+        text++;
+        if (*text != ':') return 0;
+        text++;
+        /* Parse seconds part */
+        if (*text < '0' || *text > '9') return 0;
+        s = (*text - 48) * 10;
+        text++;
+        if (*text < '0' || *text > '9') return 0;
+        s += (*text - 48);
+        if (s > 59) return 0;
+        text++;
+        /* Check for optional fraction seconds part */
+        if (*text == '.') {
+            if (h == 24) return 0;
+            text++;
+            /* Dangling decimal point is not allowed */
+            if (*text < '0' || *text > '9') return 0;
+            text++;
+            while (*text >= '0' && *text <= '9') text++;
+        }
+        if (h == 24 && (min > 0 || s > 0)) return 0;
+    }
+    if (*text == '\0') return 1;
+    /* Parse optional time zone part */
     switch (*text) {
     case 'Z':
         text++;
@@ -5732,19 +7112,19 @@ isodateImpl (
             text++;
         }
         if (*text != ':') return 0;
-        h = atoi(text-2);
-        if (h > 14) return 0;
+        zh = atoi(text-2);
+        if (zh > 14) return 0;
         text++;
         for (i = 0; i < 2; i++) {
             if (*text < '0' || *text > '9') return 0;
             text++;
         }
         if (*text != '\0') return 0;
-        min = atoi(text-2);
-        if (h < 14) {
-            if (min > 59) return 0;
+        zm = atoi(text-2);
+        if (zh < 14) {
+            if (zm > 59) return 0;
         } else {
-            if (min != 0) return 0;
+            if (zm != 0) return 0;
         }
         break;
     default:
@@ -5754,7 +7134,7 @@ isodateImpl (
 }
 
 static int
-isodateTCObjCmd (
+dateTCObjCmd (
     ClientData clientData,
     Tcl_Interp *interp,
     int objc,
@@ -5765,10 +7145,48 @@ isodateTCObjCmd (
     SchemaConstraint *sc;
 
     CHECK_TI
-    CHECK_TOPLEVEL
     checkNrArgs (1,1,"No arguments expected");
     ADD_CONSTRAINT (sdata, sc)
     sc->constraint = isodateImpl;
+    sc->constraintData = (void *) 0;
+    return TCL_OK;
+}
+
+static int
+dateTimeTCObjCmd (
+    ClientData clientData,
+    Tcl_Interp *interp,
+    int objc,
+    Tcl_Obj *const objv[]
+    )
+{
+    SchemaData *sdata = GETASI;
+    SchemaConstraint *sc;
+
+    CHECK_TI
+    checkNrArgs (1,1,"No arguments expected");
+    ADD_CONSTRAINT (sdata, sc)
+    sc->constraint = isodateImpl;
+    sc->constraintData = (void *) 1;
+    return TCL_OK;
+}
+
+static int
+timeTCObjCmd (
+    ClientData clientData,
+    Tcl_Interp *interp,
+    int objc,
+    Tcl_Obj *const objv[]
+    )
+{
+    SchemaData *sdata = GETASI;
+    SchemaConstraint *sc;
+
+    CHECK_TI
+    checkNrArgs (1,1,"No arguments expected");
+    ADD_CONSTRAINT (sdata, sc)
+    sc->constraint = isodateImpl;
+    sc->constraintData = (void *) 2;
     return TCL_OK;
 }
 
@@ -5779,7 +7197,7 @@ maxLengthImpl (
     char *text
     )
 {
-    long maxlen = (long) constraintData;
+    unsigned int maxlen = PTR2UINT(constraintData);
     int len = 0, clen;
 
     while (*text != '\0') {
@@ -5805,12 +7223,11 @@ maxLengthTCObjCmd (
 {
     SchemaData *sdata = GETASI;
     SchemaConstraint *sc;
-    long len;
+    int len;
 
     CHECK_TI
-    CHECK_TOPLEVEL
     checkNrArgs (2,2,"Expected: <maximal length as integer>");
-    if (Tcl_GetLongFromObj (interp, objv[1], &len) != TCL_OK) {
+    if (Tcl_GetIntFromObj (interp, objv[1], &len) != TCL_OK) {
         SetResult ("Expected: <maximal length as integer>");
         return TCL_ERROR;
     }
@@ -5819,7 +7236,7 @@ maxLengthTCObjCmd (
     }
     ADD_CONSTRAINT (sdata, sc)
     sc->constraint = maxLengthImpl;
-    sc->constraintData = (void *)len;
+    sc->constraintData = UINT2PTR(len);
     return TCL_OK;
 }
 
@@ -5830,9 +7247,8 @@ minLengthImpl (
     char *text
     )
 {
-    long minlen = (long) constraintData;
+    unsigned int minlen = PTR2UINT(constraintData);
     int len = 0, clen;
-
     while (*text != '\0') {
         clen = UTF8_CHAR_LEN (*text);
         if (!clen) {
@@ -5856,12 +7272,11 @@ minLengthTCObjCmd (
 {
     SchemaData *sdata = GETASI;
     SchemaConstraint *sc;
-    long len;
+    int len;
 
     CHECK_TI
-    CHECK_TOPLEVEL
     checkNrArgs (2,2,"Expected: <minimum length as integer>");
-    if (Tcl_GetLongFromObj (interp, objv[1], &len) != TCL_OK) {
+    if (Tcl_GetIntFromObj (interp, objv[1], &len) != TCL_OK) {
         SetResult ("Expected: <minimum length as integer>");
         return TCL_ERROR;
     }
@@ -5870,7 +7285,7 @@ minLengthTCObjCmd (
     }
     ADD_CONSTRAINT (sdata, sc)
     sc->constraint = minLengthImpl;
-    sc->constraintData = (void *)len;
+    sc->constraintData = UINT2PTR(len);
     return TCL_OK;
 }
 
@@ -5909,7 +7324,6 @@ oneOfTCObjCmd (
     int rc;
 
     CHECK_TI
-    CHECK_TOPLEVEL
     checkNrArgs (2,2,"Expected: <text constraint script>");
     
     cp = initSchemaCP (SCHEMA_CTYPE_CHOICE, NULL, NULL);
@@ -5939,7 +7353,6 @@ allOfTCObjCmd (
     int rc;
 
     CHECK_TI
-    CHECK_TOPLEVEL
     checkNrArgs (2,2,"Expected: <text constraint script>");
     
     cp = initSchemaCP (SCHEMA_CTYPE_CHOICE, NULL, NULL);
@@ -5995,7 +7408,6 @@ stripTCObjCmd (
     int rc;
 
     CHECK_TI
-    CHECK_TOPLEVEL
     checkNrArgs (2,2,"Expected: <text constraint script>");
     
     cp = initSchemaCP (SCHEMA_CTYPE_CHOICE, NULL, NULL);
@@ -6124,7 +7536,6 @@ splitTCObjCmd (
     };
 
     CHECK_TI
-    CHECK_TOPLEVEL
     if (objc < 2) {
         SetResult("Expected: ?type ?args?? <text constraint script>");
         return TCL_ERROR;
@@ -6248,7 +7659,6 @@ idTCObjCmd (
     SchemaDocKey *dk;
 
     CHECK_TI
-    CHECK_TOPLEVEL
     checkNrArgs (1,2,"?key_space?");
     ADD_CONSTRAINT (sdata, sc)
     if (objc == 1) {
@@ -6324,7 +7734,6 @@ idrefTCObjCmd (
     SchemaDocKey *dk;
 
     CHECK_TI
-    CHECK_TOPLEVEL
     checkNrArgs (1,2,"?key_space?");
     ADD_CONSTRAINT (sdata, sc)
     if (objc == 1) {
@@ -6389,7 +7798,6 @@ keyTCObjCmd (
     SchemaKeySpace *ks;
 
     CHECK_TI
-    CHECK_TOPLEVEL
     checkNrArgs (2,2,"key_space");
     ADD_CONSTRAINT (sdata, sc)
     h = Tcl_CreateHashEntry (&sdata->keySpaces, Tcl_GetString (objv[1]), &hnew);
@@ -6441,7 +7849,6 @@ keyrefTCObjCmd (
     SchemaKeySpace *ks;
 
     CHECK_TI
-    CHECK_TOPLEVEL
     checkNrArgs (2,2,"key_space");
     ADD_CONSTRAINT (sdata, sc)
     h = Tcl_CreateHashEntry (&sdata->keySpaces, Tcl_GetString (objv[1]),
@@ -6510,7 +7917,6 @@ base64TCObjCmd (
     SchemaConstraint *sc;
 
     CHECK_TI
-    CHECK_TOPLEVEL
     checkNrArgs (1,1,"No arguments expected");
     ADD_CONSTRAINT (sdata, sc)
     sc->constraint = base64Impl;
@@ -6539,7 +7945,6 @@ nameTCObjCmd (
     SchemaConstraint *sc;
 
     CHECK_TI
-    CHECK_TOPLEVEL
     checkNrArgs (1,1,"No arguments expected");
     ADD_CONSTRAINT (sdata, sc)
     sc->constraint = nameImpl;
@@ -6568,7 +7973,6 @@ ncnameTCObjCmd (
     SchemaConstraint *sc;
 
     CHECK_TI
-    CHECK_TOPLEVEL
     checkNrArgs (1,1,"No arguments expected");
     ADD_CONSTRAINT (sdata, sc)
     sc->constraint = ncnameImpl;
@@ -6597,7 +8001,6 @@ qnameTCObjCmd (
     SchemaConstraint *sc;
 
     CHECK_TI
-    CHECK_TOPLEVEL
     checkNrArgs (1,1,"No arguments expected");
     ADD_CONSTRAINT (sdata, sc)
     sc->constraint = qnameImpl;
@@ -6638,7 +8041,6 @@ hexBinaryTCObjCmd (
     SchemaConstraint *sc;
 
     CHECK_TI
-    CHECK_TOPLEVEL
     checkNrArgs (1,1,"No arguments expected");
     ADD_CONSTRAINT (sdata, sc)
     sc->constraint = hexBinaryImpl;
@@ -6697,11 +8099,447 @@ unsignedIntTypesTCObjCmd (
     SchemaConstraint *sc;
 
     CHECK_TI
-    CHECK_TOPLEVEL
     checkNrArgs (1,1,"No arguments expected");
     ADD_CONSTRAINT (sdata, sc)
     sc->constraint = unsignedIntTypesImpl;
     sc->constraintData = clientData;
+    return TCL_OK;
+}
+
+static void
+setvarImplFree (
+    void *constraintData
+    )
+{
+    FREE (constraintData);
+}
+
+static int
+setvarImpl (
+    Tcl_Interp *interp,
+    void *constraintData,
+    char *text
+    )
+{
+    char *varName = (char *)constraintData;
+
+    if (!Tcl_SetVar (interp, varName, text, TCL_LEAVE_ERR_MSG)) {
+        return 0;
+    }
+    return 1;
+}
+
+static int
+setvarTCObjCmd (
+    ClientData clientData,
+    Tcl_Interp *interp,
+    int objc,
+    Tcl_Obj *const objv[]
+    )
+{
+    SchemaData *sdata = GETASI;
+    SchemaConstraint *sc;
+
+    CHECK_TI
+    checkNrArgs (2,2,"<tcl variable name>");
+    ADD_CONSTRAINT (sdata, sc)
+    sc->constraint = setvarImpl;
+    sc->freeData = setvarImplFree;
+    sc->constraintData = tdomstrdup (Tcl_GetString (objv[1]));
+    return TCL_OK;
+}
+
+typedef struct
+{
+    SchemaCP *cp;
+    SchemaData *sdata;
+} WhitespaceTCData;
+
+static void
+whitespaceImplFree (
+    void *constraintData
+    )
+{
+    WhitespaceTCData *wsdata = (WhitespaceTCData *) constraintData;
+
+    FREE (wsdata);
+}
+
+static int
+whitespaceImplReplace (
+    Tcl_Interp *interp,
+    void *constraintData,
+    char *text
+    )
+{
+    WhitespaceTCData *wsdata = (WhitespaceTCData *) constraintData;
+    char *p, *c, *alloced;
+    SchemaData *sdata;
+
+    sdata = wsdata->sdata;
+    p = text;
+    c = sdata->wsbuf;
+    alloced = sdata->wsbuf + sdata->wsbufLen;
+    while (*p) {
+        if (*p == '\t' || *p == '\n' || *p == '\r') {
+            *c = ' ';
+        } else {
+            *c = *p;
+        }
+        c++;
+        if (c == alloced) {
+            sdata->wsbuf = REALLOC (sdata->wsbuf, 2 * sdata->wsbufLen);
+            c = sdata->wsbuf + sdata->wsbufLen;
+            sdata->wsbufLen *= 2;
+            alloced = sdata->wsbuf + sdata->wsbufLen;
+        }
+        p++;
+    }
+    *c = '\0';
+    return checkText (interp, wsdata->cp, sdata->wsbuf);
+}
+
+static int
+whitespaceImplCollapse (
+    Tcl_Interp *interp,
+    void *constraintData,
+    char *text
+    )
+{
+    WhitespaceTCData *wsdata = (WhitespaceTCData *) constraintData;
+    char *p, *c, *alloced;
+    SchemaData *sdata;
+
+    sdata = wsdata->sdata;
+    p = text;
+    c = sdata->wsbuf;
+    alloced = sdata->wsbuf + sdata->wsbufLen;
+    while (SPACE(*p)) p++;
+    while (*p) {
+        if (SPACE (*p)) {
+            *c = ' ';
+            c++;
+            if (c == alloced) {
+                sdata->wsbuf = REALLOC (sdata->wsbuf, 2 * sdata->wsbufLen);
+                c = sdata->wsbuf + sdata->wsbufLen;
+                sdata->wsbufLen *= 2;
+                alloced = sdata->wsbuf + sdata->wsbufLen;
+            }
+            p++;
+            while (SPACE (*p)) p++;
+            if (!*p) c--;
+        } else {
+            *c = *p;
+            c++;
+            if (c == alloced) {
+                sdata->wsbuf = REALLOC (sdata->wsbuf, 2 * sdata->wsbufLen);
+                c = sdata->wsbuf + sdata->wsbufLen;
+                sdata->wsbufLen *= 2;
+                alloced = sdata->wsbuf + sdata->wsbufLen;
+            }
+            p++;
+        }
+    }
+    *c = '\0';
+    return checkText (interp, wsdata->cp, wsdata->sdata->wsbuf);
+}
+
+static int
+whitespaceTCObjCmd (
+    ClientData clientData,
+    Tcl_Interp *interp,
+    int objc,
+    Tcl_Obj *const objv[]
+    )
+{
+    SchemaData *sdata = GETASI;
+    SchemaCP *cp;
+    SchemaConstraint *sc;
+    int type;
+    WhitespaceTCData *wsdata;
+
+    static const char *types[] = {
+        "preserve", "replace", "collapse", NULL
+    };
+    enum typeSyms {
+        t_preserve, t_replace, t_collapse
+    };
+        
+    CHECK_TI
+    checkNrArgs (3,3,"(\"preserve\"|\"replace\"|\"collapse\") "
+                 "<text constraint script>");
+    if (Tcl_GetIndexFromObj (interp, objv[1], types, "type", 0, &type)
+        != TCL_OK) {
+        return TCL_ERROR;
+    }
+    cp = initSchemaCP (SCHEMA_CTYPE_CHOICE, NULL, NULL);
+    cp->type = SCHEMA_CTYPE_TEXT;
+    REMEMBER_PATTERN (cp)
+    if (evalConstraints (interp, sdata, cp, objv[2]) != TCL_OK) {
+        return TCL_ERROR;
+    }
+    if (type == t_preserve) {
+        ADD_CONSTRAINT (sdata, sc)
+        sc->constraint = checkText;
+        sc->constraintData = (void *)cp;
+        return TCL_OK;
+    }
+    ADD_CONSTRAINT (sdata, sc)
+    sc->freeData = whitespaceImplFree;
+    if (sdata->wsbufLen == 0) {
+        sdata->wsbuf = (char *) MALLOC (WHITESPACETC_BUFFER_LEN_INIT);
+        sdata->wsbufLen = WHITESPACETC_BUFFER_LEN_INIT;
+    }
+    wsdata = TMALLOC (WhitespaceTCData);
+    wsdata->sdata = sdata;
+    wsdata->cp = cp;
+    sc->constraintData = (void *)wsdata;
+    if (type == t_replace) {
+        sc->constraint = whitespaceImplReplace;
+    } else {
+        sc->constraint = whitespaceImplCollapse;
+    }
+    return TCL_OK;
+}
+
+static int
+notImpl (
+    Tcl_Interp *interp,
+    void *constraintData,
+    char *text
+    )
+{
+    SchemaCP *cp = (SchemaCP *) constraintData;
+    SchemaConstraint *sc;
+    int i;
+
+    /* Look also at checkText and oneOfImpl */
+    for (i = 0; i < cp->nc; i++) {
+        sc = (SchemaConstraint *) cp->content[i];
+        if ((sc->constraint) (interp, sc->constraintData, text)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int
+notTCObjCmd (
+    ClientData clientData,
+    Tcl_Interp *interp,
+    int objc,
+    Tcl_Obj *const objv[]
+    )
+{
+    SchemaData *sdata = GETASI;
+    SchemaCP *cp;
+    SchemaConstraint *sc;
+    int rc;
+
+    CHECK_TI
+    checkNrArgs (2,2,"Expected: <text constraint script>");
+    
+    cp = initSchemaCP (SCHEMA_CTYPE_CHOICE, NULL, NULL);
+    cp->type = SCHEMA_CTYPE_TEXT;
+    REMEMBER_PATTERN (cp)
+    rc = evalConstraints (interp, sdata, cp, objv[1]);
+    if (rc == TCL_OK) {
+        ADD_CONSTRAINT (sdata, sc)
+        sc->constraint = notImpl;
+        sc->constraintData = (void *)cp;
+        return TCL_OK;
+    }
+    return TCL_ERROR;
+}
+
+static int
+durationImpl (
+    Tcl_Interp *interp,
+    void *constraintData,
+    char *text
+    )
+{
+    /* PnYnMnDTnHnMnS */
+    int p, n, seen = 0, seenT = 0;
+    char des[9] = " YMDTHMS";
+    
+    if (*text == '-') {
+        /* Negative duration is allowed */
+        text++;
+    }
+    if (*text != 'P') return 0;
+    text++;
+    p = 0;
+    while (*text) {
+        n = 0;
+        while (*text >= '0' && *text <= '9') {
+            n++;
+            text++;
+        }
+        if (!*text) return 0;
+        if (*text == '.') {
+            if (p < 4 || !n) return 0;
+            text++;
+            if (!*text) return 0;
+            /* Ensure at least one digit after . */
+            if (*text < '0' || *text > '9') return 0;
+            text++;
+            while (*text >= '0' && *text <= '9') text++;
+            if (*text != 'S') return 0;
+            text++;
+            if (*text) return 0;
+            return 1;
+        }
+        for (; p < 8; p++) {
+            if (*text == des[p]) break;
+        }
+        if (p ==  4) {
+            if (n) return 0;
+            seenT = 1;
+            text++;
+            if (!*text) return 0;
+            continue;
+        } else {
+            if (!n) return 0;
+            seen = 1;
+        }
+        if (p > 4 && !seenT) return 0;
+        if (p == 8 || !seen) return 0;
+        text++;
+    }
+    if (!p) return 0;
+    return 1;
+}
+
+static int
+durationTCObjCmd (
+    ClientData clientData,
+    Tcl_Interp *interp,
+    int objc,
+    Tcl_Obj *const objv[]
+    )
+{
+    SchemaData *sdata = GETASI;
+    SchemaConstraint *sc;
+
+    CHECK_TI
+    checkNrArgs (1,1,"No arguments expected");
+    ADD_CONSTRAINT (sdata, sc)
+    sc->constraint = durationImpl;
+    return TCL_OK;
+}
+
+static int
+lengthImpl (
+    Tcl_Interp *interp,
+    void *constraintData,
+    char *text
+    )
+{
+    unsigned int length = PTR2UINT(constraintData);
+    int len = 0, clen;
+    while (*text != '\0') {
+        clen = UTF8_CHAR_LEN (*text);
+        if (!clen) {
+            SetResult ("Invalid UTF-8 character");
+            return 0;
+        }
+        len++;
+        if (len > length) return 0;
+        text += clen;
+    }
+    if (len == length) return 1;
+    return 0;
+}
+
+static int
+lengthTCObjCmd (
+    ClientData clientData,
+    Tcl_Interp *interp,
+    int objc,
+    Tcl_Obj *const objv[]
+    )
+{
+    SchemaData *sdata = GETASI;
+    SchemaConstraint *sc;
+    int len;
+
+    CHECK_TI
+    checkNrArgs (2,2,"Expected: <length as integer>");
+    if (Tcl_GetIntFromObj (interp, objv[1], &len) != TCL_OK) {
+        SetResult ("Expected: <length as integer>");
+        return TCL_ERROR;
+    }
+    if (len < 0) {
+        SetResult ("The length must be at least 0");
+    }
+    ADD_CONSTRAINT (sdata, sc)
+    sc->constraint = lengthImpl;
+    sc->constraintData = UINT2PTR(len);
+    return TCL_OK;
+}
+
+static int
+dateObjCmd (
+    ClientData clientData,
+    Tcl_Interp *interp,
+    int objc,
+    Tcl_Obj *const objv[]
+    )
+{
+    checkNrArgs (2,2,"<text>");
+    Tcl_SetObjResult (interp,
+                      Tcl_NewBooleanObj (
+                          isodateImpl (interp, NULL,
+                                       Tcl_GetString (objv[1]))));
+    return TCL_OK;
+}
+
+static int
+dateTimeObjCmd (
+    ClientData clientData,
+    Tcl_Interp *interp,
+    int objc,
+    Tcl_Obj *const objv[]
+    )
+{
+    checkNrArgs (2,2,"<text>");
+    Tcl_SetObjResult (interp,
+                      Tcl_NewBooleanObj (
+                          isodateImpl (interp, (void *) 1,
+                                       Tcl_GetString (objv[1]))));
+    return TCL_OK;
+}
+
+static int
+timeObjCmd (
+    ClientData clientData,
+    Tcl_Interp *interp,
+    int objc,
+    Tcl_Obj *const objv[]
+    )
+{
+    checkNrArgs (2,2,"<text>");
+    Tcl_SetObjResult (interp,
+                      Tcl_NewBooleanObj (
+                          isodateImpl (interp, (void *) 2,
+                                       Tcl_GetString (objv[1]))));
+    return TCL_OK;
+}
+
+static int
+durationObjCmd (
+    ClientData clientData,
+    Tcl_Interp *interp,
+    int objc,
+    Tcl_Obj *const objv[]
+    )
+{
+    checkNrArgs (2,2,"<text>");
+    Tcl_SetObjResult (interp,
+                      Tcl_NewBooleanObj (
+                          durationImpl (interp, NULL,
+                                        Tcl_GetString (objv[1]))));
     return TCL_OK;
 }
 
@@ -6715,27 +8553,30 @@ tDOM_SchemaInit (
 
     /* Inline definition commands. */
     Tcl_CreateObjCommand (interp, "tdom::schema::defelement",
-                          schemaInstanceCmd, NULL, NULL);
+                          tDOM_schemaInstanceCmd, NULL, NULL);
+    Tcl_CreateObjCommand (interp, "tdom::schema::defelementtype",
+                          tDOM_schemaInstanceCmd, NULL, NULL);
     Tcl_CreateObjCommand (interp, "tdom::schema::defpattern",
-                          schemaInstanceCmd, NULL, NULL);
-    Tcl_CreateObjCommand (interp, "tdom::schema::deftext",
-                          schemaInstanceCmd, NULL, NULL);
+                          tDOM_schemaInstanceCmd, NULL, NULL);
+    Tcl_CreateObjCommand (interp, "tdom::schema::deftexttype",
+                          tDOM_schemaInstanceCmd, NULL, NULL);
     Tcl_CreateObjCommand (interp, "tdom::schema::start",
-                          schemaInstanceCmd, NULL, NULL);
+                          tDOM_schemaInstanceCmd, NULL, NULL);
     Tcl_CreateObjCommand (interp, "tdom::schema::prefixns",
-                          schemaInstanceCmd, NULL, NULL);
+                          tDOM_schemaInstanceCmd, NULL, NULL);
 
     /* The "any" definition command. */
     Tcl_CreateObjCommand (interp, "tdom::schema::any",
                           AnyPatternObjCmd, NULL, NULL);
 
-    /* The named pattern commands "element" and "ref". */
+    /* The named pattern commands "element", "elementtype" and
+     * "ref". */
     Tcl_CreateObjCommand (interp, "tdom::schema::element",
-                          NamedPatternObjCmd,
-                          (ClientData) SCHEMA_CTYPE_NAME, NULL);
+                          NamedPatternObjCmd, (ClientData) 0, NULL);
+    Tcl_CreateObjCommand (interp, "tdom::schema::elementtype",
+                          NamedPatternObjCmd, (ClientData) 1, NULL);
     Tcl_CreateObjCommand (interp, "tdom::schema::ref",
-                          NamedPatternObjCmd,
-                          (ClientData) SCHEMA_CTYPE_PATTERN, NULL);
+                          NamedPatternObjCmd, (ClientData) 2, NULL);
 
     /* The anonymous pattern commands "choise", "mixed", "interleave"
      * and "group". */
@@ -6759,17 +8600,25 @@ tDOM_SchemaInit (
     Tcl_CreateObjCommand (interp, "tdom::schema::text",
                           TextPatternObjCmd, NULL, NULL);
 
-    /* The 'virtual' "tcl" definition command */
+    /* The 'virtual' "tcl" and the "self" definition command */
     Tcl_CreateObjCommand (interp, "tdom::schema::tcl",
                           VirtualPatternObjCmd, NULL, NULL);
+    Tcl_CreateObjCommand (interp, "tdom::schema::self",
+                          SelfObjCmd, NULL, NULL);
 
     /* XPath contraints for DOM validation */
     Tcl_CreateObjCommand (interp,"tdom::schema::domunique",
                           domuniquePatternObjCmd, NULL, NULL);
+    Tcl_CreateObjCommand (interp,"tdom::schema::domxpathboolean",
+                          domxpathbooleanPatternObjCmd, NULL, NULL);
 
     /* Local key constraints */
     Tcl_CreateObjCommand (interp, "tdom::schema::keyspace",
                           keyspacePatternObjCmd, NULL, NULL);
+    
+    /* The associate command */
+    Tcl_CreateObjCommand (interp,"tdom::schema::associate",
+                          associatePatternObjCmd, NULL, NULL);
     
     /* The text constraint commands */
     Tcl_CreateObjCommand (interp,"tdom::schema::text::integer",
@@ -6800,8 +8649,14 @@ tDOM_SchemaInit (
                           numberTCObjCmd, NULL, NULL);
     Tcl_CreateObjCommand (interp,"tdom::schema::text::boolean",
                           booleanTCObjCmd, NULL, NULL);
-    Tcl_CreateObjCommand (interp,"tdom::schema::text::isodate",
-                          isodateTCObjCmd, NULL, NULL);
+    Tcl_CreateObjCommand (interp,"tdom::schema::text::date",
+                          dateTCObjCmd, NULL, NULL);
+    Tcl_CreateObjCommand (interp,"tdom::schema::text::dateTime",
+                          dateTimeTCObjCmd, NULL, NULL);
+    Tcl_CreateObjCommand (interp,"tdom::schema::text::time",
+                          timeTCObjCmd, NULL, NULL);
+    Tcl_CreateObjCommand (interp,"tdom::schema::text::duration",
+                          durationTCObjCmd, NULL, NULL);
     Tcl_CreateObjCommand (interp,"tdom::schema::text::maxLength",
                           maxLengthTCObjCmd, NULL, NULL);
     Tcl_CreateObjCommand (interp,"tdom::schema::text::minLength",
@@ -6840,6 +8695,33 @@ tDOM_SchemaInit (
                           unsignedIntTypesTCObjCmd, (ClientData) 2, NULL);
     Tcl_CreateObjCommand (interp,"tdom::schema::text::unsignedLong",
                           unsignedIntTypesTCObjCmd, (ClientData) 3, NULL);
+    Tcl_CreateObjCommand (interp,"tdom::schema::text::setvar",
+                          setvarTCObjCmd, (ClientData) 3, NULL);
+    Tcl_CreateObjCommand (interp,"tdom::schema::text::whitespace",
+                          whitespaceTCObjCmd, (ClientData) 3, NULL);
+    Tcl_CreateObjCommand (interp,"tdom::schema::text::not",
+                          notTCObjCmd, (ClientData) 3, NULL);
+    Tcl_CreateObjCommand (interp,"tdom::schema::text::length",
+                          lengthTCObjCmd, (ClientData) 3, NULL);
+
+    /* Exposed text type commands */
+    Tcl_CreateObjCommand (interp,"tdom::type::date",
+                          dateObjCmd, NULL, NULL);
+    Tcl_CreateObjCommand (interp,"tdom::type::dateTime",
+                          dateTimeObjCmd, NULL, NULL);
+    Tcl_CreateObjCommand (interp,"tdom::type::time",
+                          timeObjCmd, NULL, NULL);
+    Tcl_CreateObjCommand (interp,"tdom::type::duration",
+                          durationObjCmd, NULL, NULL);
+
+}
+
+#else   /* #ifndef TDOM_NO_SCHEMA */
+
+SchemaData *
+tdomGetSchemadata (void) 
+{
+    return 0;
 }
 
 
