@@ -1,3 +1,8 @@
+# Simple converter from (sane) xsd to tdom schema.
+#
+# BEWARE: within the xsd namespace used in this code there is a 'list'
+# command. Refer to the core [list] command by ::list.
+
 package require tdom
 namespace import tdom::*
 
@@ -36,6 +41,7 @@ proc xsd::tclxsdtypes {type value} {
 
 proc xsd::prolog {} {
     puts "# Prolog"
+    puts "::namespace eval ::xsd { }"
     puts "proc ::xsd::tclxsdtypes {type value} \{[info body ::xsd::tclxsdtypes]\}"
     puts "# Prolog end"
 }
@@ -97,7 +103,7 @@ proc xsd::getQuant {node} {
                 0 {
                     # Huch: min == 1 and max == 0, ?
                 }
-                1 {return ""}
+                1 {return "!"}
                 "unbounded" {return +}
                 default {return "{1 $max}"}
             }
@@ -342,30 +348,94 @@ rproc xsd::restriction {node} {
         set thisns $ns
         set type $base
     }
-    if {$thisns eq "http://www.w3.org/2001/XMLSchema"} {
-        # Derived from an xsd base type
-        #
-        # The first restiction element child may be an annotation.
-        set firstxsdchild [$node selectNodes {xsd:*[1]}]
-        if {$firstxsdchild != "" && [$firstxsdchild localName] eq "annotation"} {
-            annotation $firstxsdchild
-        }
-        # If the type has just enumeration restriction we just use the
-        # tDOM schema enumeration type and don't look at the base
-        # type.
-        if {![llength [$node selectNodes {
-            xsd:*[local-name() != 'enumeration'
-                  and local-name() != 'annotation'][1]}]]} {
-            # enumeration only
-            foreach enumvalue [$node selectNodes xsd:enumeration] {
+    switch [[$node parentNode] localName] {
+        "simpleType" {
+            if {$thisns eq "http://www.w3.org/2001/XMLSchema"} {
+                # Derived from an xsd base type
+                #
+                # The first restiction element child may be an annotation.
+                set firstxsdchild [$node selectNodes {xsd:*[1]}]
+                if {$firstxsdchild != "" && [$firstxsdchild localName] eq "annotation"} {
+                    annotation $firstxsdchild
+                }
+                # If the type has just enumeration restriction we just use the
+                # tDOM schema enumeration type and don't look at the base
+                # type.
+                if {![llength [$node selectNodes {
+                    xsd:*[local-name() != 'enumeration'
+                          and local-name() != 'annotation'][1]}]]} {
+                    # enumeration only
+                    foreach enumvalue [$node selectNodes xsd:enumeration] {
 
+                    }
+                    return
+                }
+                sput [mapXsdTypeToSchema $type]
+            } else {
+                # Derived from another simple Type
             }
-            return
         }
-        sput [mapXsdTypeToSchema $type]
-    } else {
-        # Derived from another simple Type
+        "simpleContent" {
+
+        }
+        "complexContent" {
+
+        }
     }
+    foreach child [$node selectNodes xsd:*] {
+        [$child localName] $child
+    }
+}
+
+rproc xsd::enumeration {node} {
+
+}
+
+rproc xsd::fractionDigits {node} {
+
+}
+
+rproc xsd::length {node} {
+
+}
+
+rproc xsd::maxExclusive {node} {
+
+}
+
+rproc xsd::maxInclusive {node} {
+
+}
+
+rproc xsd::maxLength {node} {
+
+}
+
+rproc xsd::minExclusive {node} {
+
+}
+
+rproc xsd::minInclusive {node} {
+
+}
+
+rproc xsd::minLength {node} {
+
+}
+
+rproc xsd::pattern {node} {
+    foreach child [$node selectNodes xsd:*] {
+        [$child localName] $child
+    }
+    sput "regexp \{^[$node @value]$\}"
+}
+
+rproc xsd::totalDigits {node} {
+
+}
+
+rproc xsd::whiteSpace {node} {
+
 }
 
 rproc xsd::union {node} {
@@ -378,7 +448,7 @@ rproc xsd::union {node} {
         }
     } else {
         foreach child [$node selectNodes xsd:*] {
-            [$child nodeName] $child
+            [$child localName] $child
         }
     }
     incr ::level -1
@@ -393,7 +463,7 @@ rproc xsd::list {node} {
         
     } else {
         foreach child [$node selectNodes xsd:*] {
-            [$child nodeName] $child
+            [$child localName] $child
         }
     }
     incr ::level -1
@@ -523,11 +593,39 @@ rproc xsd::elementWorker {node} {
             sput "\{text type $thisns:$type\}"
             return
         } elseif {[dict exists $xsddata namespace $thisns complexType $type]} {
-            if {$thisns eq $targetns} {
-                append result "\{ref $type\}\n"
-            } else {
+            set xsd [dict get $xsddata namespace $thisns complexType $type xsd]
+            set attdefinitions [$xsd selectNodes {
+                xsd:attribute
+                | xsd:atttributeGroup
+            }]
+            set haveScriptStart 0
+            if {[llength $attdefinitions]} {
+                set haveScriptStart 1
                 append result "\{\n"
+                incr ::level
+                foreach child $attdefinitions {
+                    [$child localName] $child
+                }
+            }
+            if {$thisns eq $targetns} {
+                if {$haveScriptStart} {
+                    sput "ref $type"
+                } else {
+                    append result "\{ref $type\}\n"
+                }
+            } else {
+                if {!$haveScriptStart} {
+                    append result "\{\n"
+                    incr ::level
+                }
                 sput "namespace [dict get $xsddata nsprefix $thisns] \{ref $type\}"
+                if {!$haveScriptStart} {
+                    incr ::level -1
+                    sput "\}"
+                }
+            }
+            if {$haveScriptStart} {
+                incr ::level -1
                 sput "\}"
             }
             return
@@ -568,8 +666,14 @@ rproc xsd::element {node} {
     elementWorker $node
 }
 
-proc xsd::simpleType {node} {
-
+rproc xsd::simpleType {node} {
+    sput "text \{"
+    incr ::level
+    foreach child [$node selectNodes xsd:*] {
+        [$child localName] $child
+    }
+    incr ::level -1
+    sput "\}"
 }
 
 rproc xsd::complexType {node} {
@@ -578,12 +682,25 @@ rproc xsd::complexType {node} {
     }
 }
 
-proc xsd::simpleContent {node} {
-    puts [[$node parentNode] asXML]
+rproc xsd::simpleContent {node} {
+    foreach child [$node selectNodes xsd:*] {
+        [$child localName] $child
+    }
 }
 
-proc xsd::complexContent {node} {
-    puts [[$node parentNode] asXML]
+rproc xsd::complexContent {node} {
+    set mixed [$node @mixed 0]
+    if {$mixed} {
+        sput "mixed \{"
+        incr ::level
+    }
+    foreach child [$node selectNodes xsd:*] {
+        [$child localName] $child
+    }
+    if {$mixed} {
+        incr ::level -1
+        sput "\}"
+    }
 }
 
 rproc xsd::any {node} {
@@ -695,7 +812,7 @@ rproc xsd::textType {node {start ""}} {
 
 rproc xsd::attribute {node} {
     variable xsddata
-
+    
     if {[[$node parentNode] localName] eq "schema"} {
         set quant "@quant@"
     } else {
@@ -727,6 +844,10 @@ rproc xsd::attribute {node} {
         set start "attribute $name $quant"
     } else {
         set start "nsattribute $name $ns $quant"
+    }
+    if {[$node hasAttribute fixed]} {
+        sput "$start \{fixed [::list [$node @fixed]]\}"
+        return
     }
     if {[$node hasAttribute type]} {
         textType $node $start
@@ -773,8 +894,10 @@ proc xsd::processGlobalComplexTypes {} {
         if {![dict exists $nsdata complexType]} continue
         dict for {complexType ctdata} [dict get $nsdata complexType] {
             set xsd [dict get $ctdata xsd]
-            set result "defpatten $complexType [dict get $xsddata nsprefix $targetns] \{\n"
-            foreach child [$xsd selectNodes xsd:*] {
+            set result "defpattern $complexType [dict get $xsddata nsprefix $targetns] \{\n"
+            foreach child [$xsd selectNodes {
+                xsd:*[local-name() != 'attribute' and local-name() != 'attributeGroup']
+            }] {
                 [$child localName] $child
             }
             append result "\}"
