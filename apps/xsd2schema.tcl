@@ -1,0 +1,818 @@
+package require tdom
+namespace import tdom::*
+
+set indent 2
+set level 0
+
+if {$argc != 1} {
+    puts stder "Usage: $argv0 <xsd-file>"
+    exit 1
+}
+
+namespace eval xsd {
+    variable xsddata [dict create]
+    variable targetNS
+    variable xsd2schemaName [dict create {*}{
+        base64Binary base64
+        decimal number
+        ID id
+        IDREF idref
+        Name name
+        NCName ncname
+        NMTOKEN nmtoken
+        QName qname
+    }]
+}
+
+# Not used by the converter code itself but written to the created
+# schema with the help of [info body].
+proc xsd::tclxsdtypes {type value} {
+    switch $type {
+        default {
+            error "Type $type not implemented"
+        }
+    }
+}
+
+proc xsd::prolog {} {
+    puts "# Prolog"
+    puts "proc ::xsd::tclxsdtypes {type value} \{[info body ::xsd::tclxsdtypes]\}"
+    puts "# Prolog end"
+}
+
+proc xsd::indent {} {
+    global indent level
+    return [string repeat " " [expr {$indent * $level}]]
+}
+
+proc rproc {name args body} {
+    proc $name $args "upvar result result;$body"
+}
+
+rproc xsd::sput {text} {
+    append result "[indent]$text\n"
+}
+
+rproc xsd::sputnnl {text} {
+    append result "[indent]$text"
+}
+
+rproc xsd::sputc {text} {
+    foreach line [split $text "\n"] {
+        append result "[indent]# $line\n"
+    }
+}
+
+rproc xsd::sputce {text} {
+    foreach line [split $text "\n"] {
+        append result "[indent]# LOOK_AT $line\n"
+    }
+}
+
+rproc xsd::out {} {
+    if {![info exists result]} {
+        return
+    }
+    puts $result
+    set result ""
+}
+
+proc xsd::getQuant {node} {
+    set min [$node @minOccurs 1]
+    set max [$node @maxOccurs 1]
+
+    switch $min {
+        0 {
+            switch $max {
+                0 {
+                    # Huch: min and max == 0, so never at all?
+                }
+                1 {return ?}
+                "unbounded" {return *}
+                default {return "{0 $max}"}
+            }
+        }
+        1 {
+            switch $max {
+                0 {
+                    # Huch: min == 1 and max == 0, ?
+                }
+                1 {return ""}
+                "unbounded" {return +}
+                default {return "{1 $max}"}
+            }
+        }
+        default {
+            if {$max < $min} {
+                # Huch, contradiction
+                return
+            } elseif {$max == $min} {
+                return $min
+            } else {
+                return "{$min $max}"
+            }
+        }
+    }
+}
+
+rproc xsd::annotation {node} {
+    foreach child [$node selectNodes xsd:*] {
+        if {[$child localName] eq "documentation"} {
+            set lang [$child getAttributeNS \
+                          "http://www.w3.org/XML/1998/namespace" lang ""]
+            if {$lang ne ""} {
+                 sputc "($lang:) [$child text]"
+            } else {
+                sputc "[$child text]"
+            }
+        } else {
+            sputc "(appinfo:) [$child text]"
+        }
+    }
+}
+
+proc xsd::nsfromprefix {contextNode prefix} {
+    return [lindex [lindex [$contextNode selectNodes {namespace::*[name()=$prefix]}] 0] 1]
+
+}
+
+proc xsd::resolveFQ {name node} {
+    if {[string first : $name] > -1} {
+        lassign [split $name :] prefix name
+        return [::list [nsfromprefix $node $prefix] $name]
+    } else {
+        return [::list \
+                    [lindex [lindex [$node selectNodes {namespace::*[name()='']}] 0] 1]\
+                    $name]
+    }
+}
+
+proc xsd::processNamespaces {} {
+    variable xsddata
+    global level
+
+    set result "prefixns \{\n"
+    set level 1
+    set nr 1
+    dict for {ns dummy} [dict get $xsddata namespace] {
+        if {$ns eq ""} {
+            dict set xsddata nsprefix $ns ""
+        } else {
+            dict set xsddata nsprefix $ns "ns$nr"
+            sput "ns$nr $ns"
+            incr nr
+        }
+    }
+    if {$nr > 1} {
+        append result "\}\n"
+        out
+    }
+    set level 0
+}
+
+proc xsd::import {import} {
+    variable xsddata
+    variable targetNS
+    
+    set schemaLocation [$import @schemaLocation ""]
+    if {$schemaLocation eq ""} {
+        sputce "import: skiping because of missing schemaLocation\n[$import asXML]"
+        return
+    }
+    if {[dict exists $xsddata imported $schemaLocation]} {
+        return
+    }
+    dict set xsddata imported $schemaLocation ""
+    set savedTargetNS $targetNS
+    try {
+        set xsddoc [dom parse [xmlReadFile [file join $::basedir $schemaLocation]]]
+        $xsddoc selectNodesNamespaces {
+            xsd "http://www.w3.org/2001/XMLSchema"
+        }
+        set xsd [$xsddoc documentElement]
+        set targetNS [$xsd @targetNamespace ""]
+        processToplevel $xsd
+    } on error errMsg {
+        sputce "Can't import\n[$import asXML]$errMsg"
+        exit
+    } finally {
+        set targetNS $savedTargetNS
+    }
+}
+
+proc xsd::include {include} {
+    variable xsddata
+    set schemaLocation [$import @schemaLocation ""]
+    if {$schemaLocation eq ""} {
+        sputce "import: skiping because of missing schemaLocation\n[$import asXML]"
+        return
+    }
+    if {[dict exists $xsddata included $schemaLocation]} {
+        return
+    }
+    dict set xsddata included $schemaLocation ""
+    try {
+        set xsddoc [dom parse [xmlReadFile [file join $::basedir $schemaLocation]]]
+        $xsddoc selectNodesNamespaces {
+            xsd "http://www.w3.org/2001/XMLSchema"
+        }
+        set xsd [$xsddoc documentElement]
+        processToplevel $xsd
+    } on error errMsg {
+        sputce "Can't import\n[$import asXML]$errMsg"
+        exit
+    }        
+}
+
+proc xsd::processToplevel {xsd} {
+    variable xsddata
+    variable targetNS
+
+    foreach toplevelelm [$xsd selectNodes xsd:*] {
+        set localname [$toplevelelm localName]
+        incr ::ecount($localname)
+        switch $localname {
+            "redefine" {
+                sputce "Global level $localname not implemented, so far"
+            }
+            "import" -
+            "include" {
+                $localname $toplevelelm
+            }
+            "annotation" {
+                annotation $toplevelelm
+            }
+            default {
+                set name [$toplevelelm @name ""]
+                incr ::tlc($localname)
+                if {$name eq ""} {
+                    sputce "Global element $localname without name"
+                    continue
+                }
+                dict set xsddata namespace $targetNS $localname $name xsd $toplevelelm
+            }
+        }
+    }
+    out
+}
+
+proc xsd::mapXsdTypeToSchema {type} {
+    variable xsd2schemaName
+
+    switch $type {
+        "base64Binary" -
+        "decimal" -
+        "ID" -
+        "IDREF" -
+        "Name" -
+        "NCName" -
+        "NMTOKEN" -
+        "QName" {
+            return [dict get $xsd2schemaName $type]
+        }
+        "anyURI" -
+        "byte" -
+        "ENTITIES" -
+        "ENTITY" -
+        "float" -
+        "gDay" -
+        "gMonth" -
+        "gMonthDay" -
+        "gYear" -
+        "gYearMonth" -
+        "int" -
+        "long" -
+        "NOTATION" -
+        "short" {
+            return "tcl ::xsd::tclxsdtypes $type"
+        }
+        "IDREFS" {
+            incr count(misc)
+            return "split idref"
+        }
+        "language" {
+            incr count(misc)
+            return "pattern {^[a-zA-Z]{1,8}(-[a-zA-Z0-9]{1,8})*$}"
+            incr count(language)
+        }
+        "NMTOKENS" {
+            incr count(misc)
+            return "tcl split nmtoken"
+            incr count(NMTOKENS)
+        }
+        "boolean" -
+        "date" -
+        "dateTime" -
+        "double" -
+        "duration" -
+        "hexBinary" -
+        "integer" -
+        "negativeInteger" -
+        "nonNegativeInteger" -
+        "nonPositiveInteger" -
+        "positiveInteger" -
+        "unsignedByte" -
+        "unsignedInt" -
+        "unsignedLong" -
+        "unsignedShort" -
+        "time" {
+            return $type
+        }
+        "normalizedString" {
+            incr count(normalizedString)
+        }
+        "string" {
+            incr count(string)
+        }
+        "token" {
+            incr count(token)
+        }
+    }
+    return ""
+}
+
+rproc xsd::restriction {node} {
+    variable xsddata
+
+    set base [$node @base]
+    if {[string first : $base] > -1} {
+        lassign [split $base :] prefix type
+        set thisns [nsfromprefix $node $prefix]
+    } else {
+        set thisns $ns
+        set type $base
+    }
+    if {$thisns eq "http://www.w3.org/2001/XMLSchema"} {
+        # Derived from an xsd base type
+        #
+        # The first restiction element child may be an annotation.
+        set firstxsdchild [$node selectNodes {xsd:*[1]}]
+        if {$firstxsdchild != "" && [$firstxsdchild localName] eq "annotation"} {
+            annotation $firstxsdchild
+        }
+        # If the type has just enumeration restriction we just use the
+        # tDOM schema enumeration type and don't look at the base
+        # type.
+        if {![llength [$node selectNodes {
+            xsd:*[local-name() != 'enumeration'
+                  and local-name() != 'annotation'][1]}]]} {
+            # enumeration only
+            foreach enumvalue [$node selectNodes xsd:enumeration] {
+
+            }
+            return
+        }
+        sput [mapXsdTypeToSchema $type]
+    } else {
+        # Derived from another simple Type
+    }
+}
+
+rproc xsd::union {node} {
+    sput "oneOf \{"
+    incr ::level
+    set memberTypes [$node @memberTypes ""]
+    if {$memberTypes ne ""} {
+        foreach memberType $memberTypes {
+
+        }
+    } else {
+        foreach child [$node selectNodes xsd:*] {
+            [$child nodeName] $child
+        }
+    }
+    incr ::level -1
+    sput "\}"
+}
+
+rproc xsd::list {node} {
+    sput "split \{"
+    incr ::level
+    set itemType [$node @itemType ""]
+    if {$itemType ne ""} {
+        
+    } else {
+        foreach child [$node selectNodes xsd:*] {
+            [$child nodeName] $child
+        }
+    }
+    incr ::level -1
+    sput "\}"
+}
+
+proc xsd::processGlobalAttributes {} {
+    variable xsddata
+
+    dict for {ns nsdata} [dict get $xsddata namespace] {
+        if {![dict exists $nsdata attribute]} continue
+        dict for {attribute data} [dict get $nsdata attribute] {
+            set xsd [dict get $data xsd]
+            dict set xsddata namespace $ns attribute $attribute script [attribute $xsd]
+        }
+    }
+}
+
+proc xsd::processGlobalAttributeGroups {} {
+    variable xsddata
+
+    dict for {ns nsdata} [dict get $xsddata namespace] {
+        if {![dict exists $nsdata attributeGroup]} continue
+        dict for {attributeGroup data} [dict get $nsdata attributeGroup] {
+            set xsd [dict get $data xsd]
+            dict set xsddata namespace $ns attributeGroup $attributeGroup \
+                script [attributeGroup $xsd]
+        }
+    }
+}
+
+proc xsd::processGlobalSimpleTypes {} {
+    variable xsddata
+    global level
+
+    incr level
+    dict for {ns nsdata} [dict get $xsddata namespace] {
+        if {![dict exists $nsdata simpleType]} continue
+        dict for {simpleType stdata} [dict get $nsdata simpleType] {
+            set xsd [dict get $stdata xsd]
+            if {$ns ne ""} {
+                set result "deftexttype [dict get $xsddata nsprefix $ns]:$simpleType \{\n"
+            } else {
+                set result "deftexttype $simpleType \{\n"
+            }
+            foreach child [$xsd selectNodes xsd:*] {
+                [$child localName] $child
+            }
+            append result  "\}"
+            out
+        }
+    }
+    incr level -1
+}
+
+rproc xsd::sequence {node} {
+    set insideChoice 0
+    if {[[$node parentNode] localName] eq "choice"} {
+        set insideChoice 1
+        sput "group [getQuant $node] \{"
+        incr ::level
+    }
+    foreach child [$node selectNodes xsd:*] {
+        [$child localName] $child
+    }
+    if {$insideChoice} {
+        sput "\}"
+        incr ::level -1
+    }
+}
+
+rproc xsd::choice {node} {
+    sput "choice [getQuant $node] \{"
+    incr ::level
+    foreach child [$node selectNodes xsd:*] {
+        [$child localName] $child
+    }
+    sput "\}"
+    incr ::level -1
+}
+
+rproc xsd::all {node} {
+    sput "interleave [getQuant $node] \{"
+    foreach child [$node selectNodes xsd:*] {
+        [$child localName] $child
+    }
+    sput "\}"
+}
+
+rproc xsd::group {node} {
+    set ref [$node @ref ""]
+    lassign [resolveFQ $ref $node] ns name
+    sput "ref $name [getQuant $node]"
+}
+
+rproc xsd::elementWorker {node} {
+    variable xsddata
+    variable targetns
+
+    set type [$node @type ""]
+    if {$type ne ""} {
+        # Refers to type definition
+        # First check, if the type name is full qualified
+        if {[string first : $type] > -1} {
+            lassign [split $type :] prefix type
+            set thisns [nsfromprefix $node $prefix]
+        } else {
+            set thisns $targetns
+        }
+        # Check for text only element with basic data type
+        if {$thisns eq "http://www.w3.org/2001/XMLSchema"} {
+            set texttypecode [mapXsdTypeToSchema $type]
+            if {$texttypecode eq ""} {
+                append result "text\n"
+            } elseif {[string first " " $texttypecode] > -1} {
+                append result "\{\n"
+                incr ::level
+                sput "text \{$texttypecode\}"
+                incr ::level -1
+                sput "\}"
+            } else {
+                append result "\{text $texttypecode\}\n"
+            }
+            return
+        }
+        if {[dict exists $xsddata namespace $thisns simpleType $type]} {
+            sput "\{text type $thisns:$type\}"
+            return
+        } elseif {[dict exists $xsddata namespace $thisns complexType $type]} {
+            if {$thisns eq $targetns} {
+                append result "\{ref $type\}\n"
+            } else {
+                append result "\{\n"
+                sput "namespace [dict get $xsddata nsprefix $thisns] \{ref $type\}"
+                sput "\}"
+            }
+            return
+        } else {
+            sputce "# Element type [$node @type] $type $thisns not found"
+        }
+        return
+    } else {
+        # Local defined type
+        append result "\{\n"
+        incr ::level
+        foreach child [$node selectNodes xsd:*] {
+            [$child localName] $child
+        }
+        incr ::level -1
+        sput "\}"
+    }
+}
+
+rproc xsd::element {node} {
+    variable xsddata
+    variable targetns
+    
+    if {[$node hasAttribute ref]} {
+        lassign [resolveFQ [$node @ref] $node] ns name
+        if {$targetns eq $ns} {
+            sput "element $name [getQuant $node]"
+        } else {
+            sput "namespace [$dict get $xsddata nsprefix $ns] \{"
+            incr ::level
+            sput "element $name [getQuant $node]"
+            incr ::level
+            sput "\}"
+        }
+        return
+    }
+    sputnnl "element [$node @name] [getQuant $node] "
+    elementWorker $node
+}
+
+proc xsd::simpleType {node} {
+
+}
+
+rproc xsd::complexType {node} {
+    foreach child [$node selectNodes xsd:*] {
+        [$child localName] $child
+    }
+}
+
+proc xsd::simpleContent {node} {
+    puts [[$node parentNode] asXML]
+}
+
+proc xsd::complexContent {node} {
+    puts [[$node parentNode] asXML]
+}
+
+rproc xsd::any {node} {
+    set quant [getQuant $node]
+    # Could be only annotation, in valid schema
+    foreach child [$node selectNodes xsd:*] {
+        sput [[$child localName] $child]
+    }
+    set processContents [$node @processContents "strict"]
+    if {$processContents ne "skip"} {
+        sputce "Loading foreign schemas is not supported."
+        sputce "Therefor the any processContents attribute value\
+                              \"$processContents\" will be effectively\
+                              the same as \"skip\"\n"
+    }
+    set namespace [$node @namespace "##any"]
+    switch $namespace {
+        "##any" {
+            sput "any $quant"
+        }
+        "##other" {
+            sputce "The any namespace attribute value\
+                           \"##other\" not supported.\n"
+            sputce  "Translated into \"##any\"\n"
+            sput "any $quant"
+        }
+        default {
+            set nsonly {}
+            foreach ns $namespace {
+                switch $ns {
+                    "##targetNamespace" {
+                        
+                    }
+                    "##local" {
+                        
+                    }
+                    default {
+                        lappend nsonly $ns
+                    }
+                }
+            }
+            if {[llength $nsonly]} {
+                if {[llength $nsonly] == 1} {
+                    append result "any $quant [lindex $nsonly 0]"
+                } else {
+                    append result "choice $quant \{\n"
+                    foreach ns $nsonly {
+                        append result "any $ns\n"
+                    }
+                    append result "\}"
+                }
+            }
+        }
+    }
+    return $result
+}
+
+proc xsd::attributeGroup {node} {
+    variable xsddata
+
+    if {[$node hasAttribute ref]} {
+        lassign [resolveFQ [$node @ref] $node] ns name
+        if {[dict exists $xsddata namespace $ns attributeGroup $name script]} {
+            set script [dict get $xsddata namespace $ns attributeGroup $name script]
+        } else {
+            set xsd [dict get $xsddata namespace $ns attributeGroup $name xsd]
+            set script [attributeGroup $xsd]
+            dict set xsddata namespace $ns attributeGroup $name script $script
+        }
+        return $script
+    }
+    set result ""
+    foreach child [$node selectNodes xsd:*] {
+        append definition [[$child localName] $child] "\n"
+    }
+    return $result
+}
+
+rproc xsd::textType {node {start ""}} {
+    variable xsddata
+    
+    set type [$node @type]
+    lassign [resolveFQ [$node @type] $node] typens typename
+    # Check for basic data type
+    if {$typens eq "http://www.w3.org/2001/XMLSchema"} {
+        set texttypecode [mapXsdTypeToSchema $typename]
+        sputnnl $start
+        if {$texttypecode ne ""} {
+            if {[string first " " $texttypecode] > -1} {
+                append result " \{\n"
+                incr ::level
+                foreach line [split $texttypecode "\n"] {
+                    sput $line
+                }
+                incr ::level -1
+                sput "\}"
+            } else {
+                append result " $texttypecode\n"
+            }
+        }
+    } else {
+        if {$typens eq ""} {
+            sput "$start type $typename"
+        } else {
+            sput "$start type [dict get $xsddata nsprefix $$typens]:$typename"
+        }
+    }
+}    
+
+rproc xsd::attribute {node} {
+    variable xsddata
+
+    if {[[$node parentNode] localName] eq "schema"} {
+        set quant "@quant@"
+    } else {
+        switch [$node @use "optional"] {
+            "prohibited" {
+                return "# LOOK_AT: attribute use 'prohibited' not supported"
+            }
+            "optional" {
+                set quant ?
+            }
+            "required" {
+                set quant !
+                
+            }
+        }
+    }
+    if {[$node hasAttribute ref]} {
+        lassign [resolveFQ [$node @ref] $node] ns name
+        set script [dict get $xsddata namespace $ns attribute $name script]
+        return [string map [::list @quant@ $quant] $script]
+    }
+    if {![$node hasAttribute name]} {
+        error "Invalid xsd file: attribute without ref and name\
+                attribute.\n[$node asXML]"
+    }
+    set name [$node @name]
+    lassign [resolveFQ $name $node] ns name
+    if {$ns eq ""} {
+        set start "attribute $name $quant"
+    } else {
+        set start "nsattribute $name $ns $quant"
+    }
+    if {[$node hasAttribute type]} {
+        textType $node $start
+    } else {
+        # Local definition by simpleType
+        sput "$start \{"
+        incr ::level
+        foreach child [$node selectNodes xsd:*] {
+            [$child localName] $child
+        }
+        incr ::level -1
+        sput "\}"
+    }
+}
+
+proc xsd::notation {node} {
+    return "# LOOK_AT: notation not supported"
+}
+
+proc xsd::processGlobalGroup {} {
+    variable xsddata
+    set result ""
+    dict for {ns nsdata} [dict get $xsddata namespace] {
+        if {![dict exists $nsdata group]} continue
+        dict for {group data} [dict get $nsdata group] {
+            set xsd [dict get $data xsd]
+            lassign [resolveFQ $group $xsd] ns name
+            append result "\ndefpattern $name [dict get $xsddata nsprefix $ns] \{\n"
+            foreach child [$xsd selectNodes xsd:*] {
+                append result "[[$child localName] $child]\n"
+            }
+            append result "\}"
+        }
+    }
+    return [string trimleft $result "\n"]
+}
+
+proc xsd::processGlobalComplexTypes {} {
+    variable xsddata
+    variable targetns
+
+    incr ::level
+    dict for {targetns nsdata} [dict get $xsddata namespace] {
+        if {![dict exists $nsdata complexType]} continue
+        dict for {complexType ctdata} [dict get $nsdata complexType] {
+            set xsd [dict get $ctdata xsd]
+            set result "defpatten $complexType [dict get $xsddata nsprefix $targetns] \{\n"
+            foreach child [$xsd selectNodes xsd:*] {
+                [$child localName] $child
+            }
+            append result "\}"
+            out
+        }
+    }
+    incr ::level -1
+}
+
+proc xsd::processGlobalElements {} {
+    variable xsddata
+    variable targetns
+
+    dict for {targetns nsdata} [dict get $xsddata namespace] {
+        if {![dict exists $nsdata element]} continue
+        dict for {element elmdata} [dict get $nsdata element] {
+            set xsd [dict get $elmdata xsd]
+            set result "defelement $element $targetns "
+            elementWorker $xsd
+            out
+        }
+    }
+}
+
+set basedir [file dirname [file normalize [lindex $argv 0]]]
+set xsddoc [dom parse [xmlReadFile [lindex $argv 0]]]
+$xsddoc selectNodesNamespaces {
+    xsd "http://www.w3.org/2001/XMLSchema"
+}
+set xsd [$xsddoc documentElement]
+set xsd::targetNS [$xsd @targetNamespace ""]
+
+xsd::prolog
+xsd::processToplevel $xsd
+xsd::processNamespaces
+xsd::processGlobalSimpleTypes
+xsd::processGlobalAttributes
+xsd::processGlobalAttributeGroups
+xsd::processGlobalGroup
+xsd::processGlobalComplexTypes
+xsd::processGlobalElements
