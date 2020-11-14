@@ -75,11 +75,15 @@ rproc xsd::sputce {text} {
     }
 }
 
-rproc xsd::out {} {
+rproc xsd::out {{nonl 0}} {
     if {![info exists result]} {
         return
     }
-    puts $result
+    if {$nonl} {
+        puts -nonewline $result
+    } else {
+        puts $result
+    }
     set result ""
 }
 
@@ -339,13 +343,14 @@ proc xsd::mapXsdTypeToSchema {type} {
 
 rproc xsd::restriction {node} {
     variable xsddata
+    variable targetns
 
     set base [$node @base]
     if {[string first : $base] > -1} {
         lassign [split $base :] prefix type
         set thisns [nsfromprefix $node $prefix]
     } else {
-        set thisns $ns
+        set thisns $targetns
         set type $base
     }
     switch [[$node parentNode] localName] {
@@ -370,7 +375,10 @@ rproc xsd::restriction {node} {
                     }
                     return
                 }
-                sput [mapXsdTypeToSchema $type]
+                set tdomtype [mapXsdTypeToSchema $type]
+                if {$tdomtype ne ""} {
+                    sput $tdomtype
+                }
             } else {
                 # Derived from another simple Type
             }
@@ -800,6 +808,8 @@ rproc xsd::textType {node {start ""}} {
             } else {
                 append result " $texttypecode\n"
             }
+        } else {
+            append result "\n"
         }
     } else {
         if {$typens eq ""} {
@@ -917,7 +927,7 @@ proc xsd::processGlobalElements {} {
             set xsd [dict get $elmdata xsd]
             set result "defelement $element $targetns "
             elementWorker $xsd
-            out
+            out 1
         }
     }
 }
