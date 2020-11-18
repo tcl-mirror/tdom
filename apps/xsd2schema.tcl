@@ -10,7 +10,7 @@ set indent 2
 set level 0
 
 if {$argc != 1} {
-    puts stder "Usage: $argv0 <xsd-file>"
+    puts stderr "Usage: $argv0 <xsd-file>"
     exit 1
 }
 
@@ -26,6 +26,7 @@ namespace eval xsd {
         NCName ncname
         NMTOKEN nmtoken
         QName qname
+        float double
     }]
 }
 
@@ -284,7 +285,6 @@ proc xsd::mapXsdTypeToSchema {type} {
         "byte" -
         "ENTITIES" -
         "ENTITY" -
-        "float" -
         "gDay" -
         "gMonth" -
         "gMonthDay" -
@@ -370,9 +370,13 @@ rproc xsd::restriction {node} {
                     xsd:*[local-name() != 'enumeration'
                           and local-name() != 'annotation'][1]}]]} {
                     # enumeration only
+                    sput "enumeration \{"
+                    incr ::level
                     foreach enumvalue [$node selectNodes xsd:enumeration] {
-
+                        sput [::list [$enumvalue @value]]
                     }
+                    incr ::level -1
+                    sput "\}"
                     return
                 }
                 set tdomtype [mapXsdTypeToSchema $type]
@@ -478,31 +482,6 @@ rproc xsd::list {node} {
     sput "\}"
 }
 
-proc xsd::processGlobalAttributes {} {
-    variable xsddata
-
-    dict for {ns nsdata} [dict get $xsddata namespace] {
-        if {![dict exists $nsdata attribute]} continue
-        dict for {attribute data} [dict get $nsdata attribute] {
-            set xsd [dict get $data xsd]
-            dict set xsddata namespace $ns attribute $attribute script [attribute $xsd]
-        }
-    }
-}
-
-proc xsd::processGlobalAttributeGroups {} {
-    variable xsddata
-
-    dict for {ns nsdata} [dict get $xsddata namespace] {
-        if {![dict exists $nsdata attributeGroup]} continue
-        dict for {attributeGroup data} [dict get $nsdata attributeGroup] {
-            set xsd [dict get $data xsd]
-            dict set xsddata namespace $ns attributeGroup $attributeGroup \
-                script [attributeGroup $xsd]
-        }
-    }
-}
-
 proc xsd::processGlobalSimpleTypes {} {
     variable xsddata
     global level
@@ -549,15 +528,17 @@ rproc xsd::choice {node} {
     foreach child [$node selectNodes xsd:*] {
         [$child localName] $child
     }
-    sput "\}"
     incr ::level -1
+    sput "\}"
 }
 
 rproc xsd::all {node} {
     sput "interleave [getQuant $node] \{"
+    incr ::level
     foreach child [$node selectNodes xsd:*] {
         [$child localName] $child
     }
+    incr ::level
     sput "\}"
 }
 
@@ -675,13 +656,19 @@ rproc xsd::element {node} {
 }
 
 rproc xsd::simpleType {node} {
-    sput "text \{"
-    incr ::level
+    set forattribute 1
+    if {[[$node parentNode] localName] ne "attribute"} {
+        set forattribute 0
+        sput "text \{"
+        incr ::level
+    }
     foreach child [$node selectNodes xsd:*] {
         [$child localName] $child
     }
-    incr ::level -1
-    sput "\}"
+    if {!$forattribute} {
+        incr ::level -1
+        sput "\}"
+    }
 }
 
 rproc xsd::complexType {node} {
@@ -766,25 +753,16 @@ rproc xsd::any {node} {
     return $result
 }
 
-proc xsd::attributeGroup {node} {
+rproc xsd::attributeGroup {node} {
     variable xsddata
 
     if {[$node hasAttribute ref]} {
         lassign [resolveFQ [$node @ref] $node] ns name
-        if {[dict exists $xsddata namespace $ns attributeGroup $name script]} {
-            set script [dict get $xsddata namespace $ns attributeGroup $name script]
-        } else {
-            set xsd [dict get $xsddata namespace $ns attributeGroup $name xsd]
-            set script [attributeGroup $xsd]
-            dict set xsddata namespace $ns attributeGroup $name script $script
-        }
-        return $script
+        set node [dict get $xsddata namespace $ns attributeGroup $name xsd]
     }
-    set result ""
     foreach child [$node selectNodes xsd:*] {
-        append definition [[$child localName] $child] "\n"
+        [$child localName] $child
     }
-    return $result
 }
 
 rproc xsd::textType {node {start ""}} {
@@ -798,7 +776,7 @@ rproc xsd::textType {node {start ""}} {
         sputnnl $start
         if {$texttypecode ne ""} {
             if {[string first " " $texttypecode] > -1} {
-                append result " \{\n"
+                sput " \{"
                 incr ::level
                 foreach line [split $texttypecode "\n"] {
                     sput $line
@@ -823,37 +801,28 @@ rproc xsd::textType {node {start ""}} {
 rproc xsd::attribute {node} {
     variable xsddata
     
-    if {[[$node parentNode] localName] eq "schema"} {
-        set quant "@quant@"
-    } else {
-        switch [$node @use "optional"] {
-            "prohibited" {
-                return "# LOOK_AT: attribute use 'prohibited' not supported"
-            }
-            "optional" {
-                set quant ?
-            }
-            "required" {
-                set quant !
-                
-            }
+    switch [$node @use "optional"] {
+        "prohibited" {
+            return "# LOOK_AT: attribute use 'prohibited' not supported"
+        }
+        "optional" {
+            set quant ?
+        }
+        "required" {
+            set quant !
+            
         }
     }
     if {[$node hasAttribute ref]} {
         lassign [resolveFQ [$node @ref] $node] ns name
-        set script [dict get $xsddata namespace $ns attribute $name script]
-        return [string map [::list @quant@ $quant] $script]
+        set node [dict get $xsddata namespace $ns attribute $name xsd]
+    } else {
+        lassign [resolveFQ [$node @name] $node] ns name
     }
-    if {![$node hasAttribute name]} {
-        error "Invalid xsd file: attribute without ref and name\
-                attribute.\n[$node asXML]"
-    }
-    set name [$node @name]
-    lassign [resolveFQ $name $node] ns name
     if {$ns eq ""} {
         set start "attribute $name $quant"
     } else {
-        set start "nsattribute $name $ns $quant"
+        set start "nsattribute $name [dict get $xsddata nsprefix $ns] $quant"
     }
     if {[$node hasAttribute fixed]} {
         sput "$start \{fixed [::list [$node @fixed]]\}"
@@ -862,14 +831,19 @@ rproc xsd::attribute {node} {
     if {[$node hasAttribute type]} {
         textType $node $start
     } else {
-        # Local definition by simpleType
-        sput "$start \{"
-        incr ::level
-        foreach child [$node selectNodes xsd:*] {
-            [$child localName] $child
+        set childs [$node selectNodes xsd:*]
+        if {[llength $childs]} {
+            # Local definition by simpleType
+            sput "$start \{"
+            incr ::level
+            foreach child [$node selectNodes xsd:*] {
+                [$child localName] $child
+            }
+            incr ::level -1
+            sput "\}"
+        } else {
+            sput $start
         }
-        incr ::level -1
-        sput "\}"
     }
 }
 
@@ -880,6 +854,7 @@ proc xsd::notation {node} {
 proc xsd::processGlobalGroup {} {
     variable xsddata
     set result ""
+    incr ::level
     dict for {ns nsdata} [dict get $xsddata namespace] {
         if {![dict exists $nsdata group]} continue
         dict for {group data} [dict get $nsdata group] {
@@ -890,15 +865,17 @@ proc xsd::processGlobalGroup {} {
                 append result "[[$child localName] $child]\n"
             }
             append result "\}"
+            out
         }
     }
-    return [string trimleft $result "\n"]
+    incr ::level -1
 }
 
 proc xsd::processGlobalComplexTypes {} {
     variable xsddata
     variable targetns
 
+    set result ""
     incr ::level
     dict for {targetns nsdata} [dict get $xsddata namespace] {
         if {![dict exists $nsdata complexType]} continue
@@ -921,6 +898,7 @@ proc xsd::processGlobalElements {} {
     variable xsddata
     variable targetns
 
+    set result ""
     dict for {targetns nsdata} [dict get $xsddata namespace] {
         if {![dict exists $nsdata element]} continue
         dict for {element elmdata} [dict get $nsdata element] {
@@ -944,8 +922,6 @@ xsd::prolog
 xsd::processToplevel $xsd
 xsd::processNamespaces
 xsd::processGlobalSimpleTypes
-xsd::processGlobalAttributes
-xsd::processGlobalAttributeGroups
 xsd::processGlobalGroup
 xsd::processGlobalComplexTypes
 xsd::processGlobalElements
