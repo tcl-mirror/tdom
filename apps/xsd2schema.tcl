@@ -1,7 +1,8 @@
 # Simple converter from (sane) xsd to tdom schema.
 #
-# BEWARE: within the xsd namespace used in this code there is a 'list'
-# command. Refer to the core [list] command by ::list.
+# BEWARE: Within the xsd namespace in this code there is a 'list'
+# procedure. Refer to the core [list] command by ::list within code
+# evaluated within the xsd namespace.
 
 package require tdom
 namespace import tdom::*
@@ -672,8 +673,61 @@ rproc xsd::simpleType {node} {
 }
 
 rproc xsd::complexType {node} {
-    foreach child [$node selectNodes xsd:*] {
-        [$child localName] $child
+    if {[$node @mixed 0]} {
+        set atts ""
+        foreach child [$node selectNodes xsd:*] {
+            switch [$child localName] {
+                "attribute" -
+                "attributeGroup" {
+                    lappend atts $child
+                }
+                "choice" {
+                    set quant [getQuant $child]
+                    if {$quant eq "*"} {
+                        sput "mixed \{"
+                    } else {
+                        sput "mixed $quant \{"
+                    }
+                    incr ::level
+                    foreach childchild [$child selectNodes xsd:*] {
+                        [$childchild localName] $childchild
+                    }
+                    incr ::level -1
+                    sput "\}"
+                }
+                "sequence" {
+
+                }
+                "all" {
+                    
+                }
+                default {
+                    [$child localName] $child
+                }
+            }
+        }
+        if {![$node selectNodes {
+            count(xsd:*[local-name() != 'annotation'
+                        and local-name() != 'attribute'
+                        and local-name() != 'attributeGroup'])
+        }]} {
+            # mixed complexType with attributes only
+            sput text
+        }
+        foreach child $atts {
+            [$child localName] $child
+        }
+    } else {
+        foreach child [$node selectNodes {
+            xsd:*[local-name() != 'attribute' and local-name() != 'attributeGroup']
+        }] {
+            [$child localName] $child
+        }
+        foreach child [$node selectNodes {
+            xsd:*[local-name() = 'attribute' or local-name() = 'attributeGroup']
+        }] {
+            [$child localName] $child
+        }
     }
 }
 
