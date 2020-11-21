@@ -15,6 +15,7 @@ if {$argc != 1} {
     exit 1
 }
 
+dom setStoreLineColumn 1
 namespace eval xsd {
     variable xsddata [dict create]
     variable targetNS
@@ -206,6 +207,7 @@ proc xsd::import {import} {
         processToplevel $xsd
     } on error errMsg {
         sputce "Can't import\n[$import asXML]$errMsg"
+        out
         exit
     } finally {
         set targetNS $savedTargetNS
@@ -232,6 +234,7 @@ proc xsd::include {include} {
         processToplevel $xsd
     } on error errMsg {
         sputce "Can't import\n[$import asXML]$errMsg"
+        out
         exit
     }        
 }
@@ -298,18 +301,13 @@ proc xsd::mapXsdTypeToSchema {type} {
             return "tcl ::xsd::tclxsdtypes $type"
         }
         "IDREFS" {
-            incr count(misc)
             return "split idref"
         }
         "language" {
-            incr count(misc)
             return "pattern {^[a-zA-Z]{1,8}(-[a-zA-Z0-9]{1,8})*$}"
-            incr count(language)
         }
         "NMTOKENS" {
-            incr count(misc)
-            return "tcl split nmtoken"
-            incr count(NMTOKENS)
+            return "split nmtoken"
         }
         "boolean" -
         "date" -
@@ -346,7 +344,7 @@ rproc xsd::restriction {node} {
     variable xsddata
     variable targetns
 
-    set base [$node @base]
+    set base [$node @base ""]
     if {[string first : $base] > -1} {
         lassign [split $base :] prefix type
         set thisns [nsfromprefix $node $prefix]
@@ -485,15 +483,15 @@ rproc xsd::list {node} {
 
 proc xsd::processGlobalSimpleTypes {} {
     variable xsddata
-    global level
-
-    incr level
-    dict for {ns nsdata} [dict get $xsddata namespace] {
+    variable targetns
+    
+    incr ::level
+    dict for {targetns nsdata} [dict get $xsddata namespace] {
         if {![dict exists $nsdata simpleType]} continue
         dict for {simpleType stdata} [dict get $nsdata simpleType] {
             set xsd [dict get $stdata xsd]
-            if {$ns ne ""} {
-                set result "deftexttype [dict get $xsddata nsprefix $ns]:$simpleType \{\n"
+            if {$targetns ne ""} {
+                set result "deftexttype [dict get $xsddata nsprefix $targetns]:$simpleType \{\n"
             } else {
                 set result "deftexttype $simpleType \{\n"
             }
@@ -504,7 +502,7 @@ proc xsd::processGlobalSimpleTypes {} {
             out
         }
     }
-    incr level -1
+    incr ::level -1
 }
 
 rproc xsd::sequence {node} {
@@ -752,6 +750,18 @@ rproc xsd::complexContent {node} {
     }
 }
 
+rproc xsd::anyAttribute {node} {
+    sputce "anyAttribute not implemented"
+}
+
+rproc xsd::extension {node} {
+    sputce "extension not implemented"
+}
+
+rproc xsd::key {node} {
+    sputce "key not implemented"
+}
+
 rproc xsd::any {node} {
     set quant [getQuant $node]
     # Could be only annotation, in valid schema
@@ -907,14 +917,14 @@ proc xsd::notation {node} {
 
 proc xsd::processGlobalGroup {} {
     variable xsddata
-    set result ""
+    variable targetns
+    
     incr ::level
-    dict for {ns nsdata} [dict get $xsddata namespace] {
+    dict for {targetns nsdata} [dict get $xsddata namespace] {
         if {![dict exists $nsdata group]} continue
         dict for {group data} [dict get $nsdata group] {
             set xsd [dict get $data xsd]
-            lassign [resolveFQ $group $xsd] ns name
-            append result "\ndefpattern $name [dict get $xsddata nsprefix $ns] \{\n"
+            append result "\ndefpattern $group [dict get $xsddata nsprefix $targetns] \{\n"
             foreach child [$xsd selectNodes xsd:*] {
                 append result "[[$child localName] $child]\n"
             }
@@ -929,7 +939,6 @@ proc xsd::processGlobalComplexTypes {} {
     variable xsddata
     variable targetns
 
-    set result ""
     incr ::level
     dict for {targetns nsdata} [dict get $xsddata namespace] {
         if {![dict exists $nsdata complexType]} continue
