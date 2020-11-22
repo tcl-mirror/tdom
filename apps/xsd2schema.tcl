@@ -407,7 +407,12 @@ rproc xsd::fractionDigits {node} {
 }
 
 rproc xsd::length {node} {
-
+    # TODO Special handling of xs:hexBinary and xs:base64Binary and
+    # list types.
+    foreach child [$node selectNodes xsd:*] {
+        [$child localName] $child
+    }
+    sput "length \{[$node @value]\}"
 }
 
 rproc xsd::maxExclusive {node} {
@@ -419,7 +424,12 @@ rproc xsd::maxInclusive {node} {
 }
 
 rproc xsd::maxLength {node} {
-
+    # TODO Special handling of xs:hexBinary and xs:base64Binary and
+    # list types.
+    foreach child [$node selectNodes xsd:*] {
+        [$child localName] $child
+    }
+    sput "maxLength \{[$node @value]\}"
 }
 
 rproc xsd::minExclusive {node} {
@@ -431,7 +441,12 @@ rproc xsd::minInclusive {node} {
 }
 
 rproc xsd::minLength {node} {
-
+    # TODO Special handling of xs:hexBinary and xs:base64Binary and
+    # list types.
+    foreach child [$node selectNodes xsd:*] {
+        [$child localName] $child
+    }
+    sput "minLength \{[$node @value]\}"
 }
 
 rproc xsd::pattern {node} {
