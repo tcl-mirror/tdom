@@ -345,16 +345,12 @@ rproc xsd::restriction {node} {
     variable targetns
 
     set base [$node @base ""]
-    if {[string first : $base] > -1} {
-        lassign [split $base :] prefix type
-        set thisns [nsfromprefix $node $prefix]
-    } else {
-        set thisns $targetns
-        set type $base
-    }
-    switch [[$node parentNode] localName] {
+    lassign [resolveFQ $base $node] typens type
+    set context [[$node parentNode] localName] 
+    switch $context {
+        "simpleContent" -
         "simpleType" {
-            if {$thisns eq "http://www.w3.org/2001/XMLSchema"} {
+            if {$typens eq "http://www.w3.org/2001/XMLSchema"} {
                 # Derived from an xsd base type
                 #
                 # The first restiction element child may be an annotation.
@@ -362,17 +358,16 @@ rproc xsd::restriction {node} {
                 if {$firstxsdchild != "" && [$firstxsdchild localName] eq "annotation"} {
                     annotation $firstxsdchild
                 }
+                
                 # If the type has just enumeration restriction we just use the
                 # tDOM schema enumeration type and don't look at the base
                 # type.
-                if {![llength [$node selectNodes {
-                    xsd:*[local-name() != 'enumeration'
-                          and local-name() != 'annotation'][1]}]]} {
-                    # enumeration only
+                set enumerations [$node selectNodes xsd:enumeration]
+                if {[llength selectNodes]} {
                     sput "enumeration \{"
                     incr ::level
-                    foreach enumvalue [$node selectNodes xsd:enumeration] {
-                        sput [::list [$enumvalue @value]]
+                    foreach enumeration $enumerations {
+                        sput [::list [$enumeration @value]]
                     }
                     incr ::level -1
                     sput "\}"
@@ -384,13 +379,21 @@ rproc xsd::restriction {node} {
                 }
             } else {
                 # Derived from another simple Type
+                if {$typens eq ""} {
+                    set typens $targetns
+                }
+                if {$typens ne ""} {
+                    sput "type [dict get $xsddata nsprefix $typens]:$type"
+                } else {
+                    sput "type $type"
+                }
+            }
+            if {$context eq "simpleContent"} {
+                sputce "simpleContent restriction to finalize"
             }
         }
-        "simpleContent" {
-
-        }
         "complexContent" {
-
+            sputce "complexType restriction to do"
         }
     }
     foreach child [$node selectNodes xsd:*] {
@@ -399,7 +402,8 @@ rproc xsd::restriction {node} {
 }
 
 rproc xsd::enumeration {node} {
-
+    # Already handled by code in xsd::restriction.
+    # Just do nothing
 }
 
 rproc xsd::fractionDigits {node} {
@@ -709,10 +713,9 @@ rproc xsd::complexType {node} {
                     sput "\}"
                 }
                 "sequence" {
-
-                }
-                "all" {
-                    
+                    foreach childchild [$child selectNodes xsd:*] {
+                        [$childchild localName] $childchild
+                    }
                 }
                 default {
                     [$child localName] $child
@@ -770,6 +773,24 @@ rproc xsd::anyAttribute {node} {
 }
 
 rproc xsd::extension {node} {
+    variable xsddata
+    
+    set base [$node @base ""]
+    lassign [resolveFQ $base $node] typens type
+    set context [[$node parentNode] localName] 
+    switch $context {
+        "simpleContent" {
+            
+        }
+        "complexContent" {
+            if {![dict exists $xsddata namespace $typens complexType $type]} {
+                sputce "Type $type in $namespace $typens not found for extension"
+                return
+            }
+            set xsd [dict get $xsddata namespace $typens complexType $type xsd]
+            
+        }
+    }
     sputce "extension not implemented"
 }
 
@@ -848,7 +869,7 @@ rproc xsd::textType {node {start ""}} {
     variable xsddata
     
     set type [$node @type]
-    lassign [resolveFQ [$node @type] $node] typens typename
+    lassign [resolveFQ $type $node] typens typename
     # Check for basic data type
     if {$typens eq "http://www.w3.org/2001/XMLSchema"} {
         set texttypecode [mapXsdTypeToSchema $typename]
