@@ -358,10 +358,6 @@ rproc xsd::restriction {node} {
                 if {$firstxsdchild != "" && [$firstxsdchild localName] eq "annotation"} {
                     annotation $firstxsdchild
                 }
-                
-                # If the type has just enumeration restriction we just use the
-                # tDOM schema enumeration type and don't look at the base
-                # type.
                 set enumerations [$node selectNodes xsd:enumeration]
                 if {[llength selectNodes]} {
                     sput "enumeration \{"
@@ -772,6 +768,10 @@ rproc xsd::anyAttribute {node} {
     sputce "anyAttribute not implemented"
 }
 
+proc xsd::getSimpleType {ns type} {
+
+}
+
 rproc xsd::extension {node} {
     variable xsddata
     
@@ -780,16 +780,30 @@ rproc xsd::extension {node} {
     set context [[$node parentNode] localName] 
     switch $context {
         "simpleContent" {
-            
+            if {![dict exists $xsddata namespace $typens simpleType $type]} {
+                sputce "simpleType $type in $namespace $typens not found for extension"
+                return
+            }
+            set xsd [dict get $xsddata namespace $typens simpleType $type xsd]
         }
         "complexContent" {
             if {![dict exists $xsddata namespace $typens complexType $type]} {
-                sputce "Type $type in $namespace $typens not found for extension"
+                sputce "complexType $type in $namespace $typens not found for extension"
                 return
             }
             set xsd [dict get $xsddata namespace $typens complexType $type xsd]
             
         }
+    }
+    foreach child [$xsd selectNodes {
+        xsd:*[local-name() != 'attribute' and local-name() != 'attributeGroup']
+    }] {
+        [$child localName] $child
+    }
+    foreach child [$node selectNodes {
+        xsd:*[local-name() = 'attribute' or local-name() = 'attributeGroup']
+    }] {
+        [$child localName] $child
     }
     sputce "extension not implemented"
 }
