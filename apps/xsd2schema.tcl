@@ -7,18 +7,15 @@
 package require tdom
 namespace import tdom::*
 
-set indent 2
-set level 0
-
-if {$argc != 1} {
-    puts stderr "Usage: $argv0 <xsd-file>"
-    exit 1
-}
-
-dom setStoreLineColumn 1
 namespace eval xsd {
-    variable xsddata [dict create]
+    variable indent 2
+    variable level 0
+    variable xsddata
+    variable basedir
     variable targetNS
+    variable schema
+    variable output "collect"
+    variable unsupportedFeaturesSeen
     variable xsd2schemaName [dict create {*}{
         base64Binary base64
         decimal number
@@ -43,19 +40,30 @@ proc xsd::tclxsdtypes {type value} {
 }
 
 proc xsd::prolog {} {
-    puts "# Prolog"
-    puts "::namespace eval ::xsd { }"
-    puts "proc ::xsd::tclxsdtypes {type value} \{[info body ::xsd::tclxsdtypes]\}"
-    puts "# Prolog end"
+    variable output
+
+    if {$output eq "collect"} {
+        variable schema
+        append schema "# Prolog\n"
+        append schema "::namespace eval ::xsd { }\n"
+        append schema "proc ::xsd::tclxsdtypes {type value} \{[info body ::xsd::tclxsdtypes]\}\n"
+        append schema "# Prolog end\n"
+    } else {
+        puts "# Prolog"
+        puts "::namespace eval ::xsd { }"
+        puts "proc ::xsd::tclxsdtypes {type value} \{[info body ::xsd::tclxsdtypes]\}"
+        puts "# Prolog end"
+    }
 }
 
 proc xsd::indent {} {
-    global indent level
+    variable indent
+    variable level
     return [string repeat " " [expr {$indent * $level}]]
 }
 
 proc rproc {name args body} {
-    proc $name $args "upvar result result;$body"
+    proc $name $args "variable level;upvar result result;$body"
 }
 
 rproc xsd::sput {text} {
@@ -79,13 +87,24 @@ rproc xsd::sputce {text} {
 }
 
 rproc xsd::out {{nonl 0}} {
+    variable output
+
     if {![info exists result]} {
         return
     }
-    if {$nonl} {
-        puts -nonewline $result
+    if {$output eq "collect"} {
+        variable schema
+        if {$nonl} {
+            append schema $result
+        } else {
+            append $result "\n"
+        }
     } else {
-        puts $result
+        if {$nonl} {
+            puts -nonewline $result
+        } else {
+            puts $result
+        }
     }
     set result ""
 }
@@ -162,7 +181,7 @@ proc xsd::resolveFQ {name node} {
 
 proc xsd::processNamespaces {} {
     variable xsddata
-    global level
+    variable level
 
     set result "prefixns \{\n"
     set level 1
@@ -186,6 +205,7 @@ proc xsd::processNamespaces {} {
 proc xsd::import {import} {
     variable xsddata
     variable targetNS
+    variable basedir
     
     set schemaLocation [$import @schemaLocation ""]
     if {$schemaLocation eq ""} {
@@ -198,7 +218,7 @@ proc xsd::import {import} {
     dict set xsddata imported $schemaLocation ""
     set savedTargetNS $targetNS
     try {
-        set xsddoc [dom parse [xmlReadFile [file join $::basedir $schemaLocation]]]
+        set xsddoc [dom parse [xmlReadFile [file join $basedir $schemaLocation]]]
         $xsddoc selectNodesNamespaces {
             xsd "http://www.w3.org/2001/XMLSchema"
         }
@@ -216,6 +236,8 @@ proc xsd::import {import} {
 
 proc xsd::include {include} {
     variable xsddata
+    variable basedir
+    
     set schemaLocation [$import @schemaLocation ""]
     if {$schemaLocation eq ""} {
         sputce "import: skiping because of missing schemaLocation\n[$import asXML]"
@@ -226,7 +248,7 @@ proc xsd::include {include} {
     }
     dict set xsddata included $schemaLocation ""
     try {
-        set xsddoc [dom parse [xmlReadFile [file join $::basedir $schemaLocation]]]
+        set xsddoc [dom parse [xmlReadFile [file join $basedir $schemaLocation]]]
         $xsddoc selectNodesNamespaces {
             xsd "http://www.w3.org/2001/XMLSchema"
         }
@@ -343,6 +365,7 @@ proc xsd::mapXsdTypeToSchema {type} {
 rproc xsd::restriction {node} {
     variable xsddata
     variable targetns
+    variable level
 
     set base [$node @base ""]
     lassign [resolveFQ $base $node] typens type
@@ -361,11 +384,11 @@ rproc xsd::restriction {node} {
                 set enumerations [$node selectNodes xsd:enumeration]
                 if {[llength selectNodes]} {
                     sput "enumeration \{"
-                    incr ::level
+                    incr level
                     foreach enumeration $enumerations {
                         sput [::list [$enumeration @value]]
                     }
-                    incr ::level -1
+                    incr level -1
                     sput "\}"
                     return
                 }
@@ -466,7 +489,7 @@ rproc xsd::whiteSpace {node} {
 
 rproc xsd::union {node} {
     sput "oneOf \{"
-    incr ::level
+    incr level
     set memberTypes [$node @memberTypes ""]
     if {$memberTypes ne ""} {
         foreach memberType $memberTypes {
@@ -477,13 +500,13 @@ rproc xsd::union {node} {
             [$child localName] $child
         }
     }
-    incr ::level -1
+    incr level -1
     sput "\}"
 }
 
 rproc xsd::list {node} {
     sput "split \{"
-    incr ::level
+    incr level
     set itemType [$node @itemType ""]
     if {$itemType ne ""} {
         
@@ -492,15 +515,16 @@ rproc xsd::list {node} {
             [$child localName] $child
         }
     }
-    incr ::level -1
+    incr level -1
     sput "\}"
 }
 
 proc xsd::processGlobalSimpleTypes {} {
     variable xsddata
     variable targetns
+    variable level
     
-    incr ::level
+    incr level
     dict for {targetns nsdata} [dict get $xsddata namespace] {
         if {![dict exists $nsdata simpleType]} continue
         dict for {simpleType stdata} [dict get $nsdata simpleType] {
@@ -517,7 +541,7 @@ proc xsd::processGlobalSimpleTypes {} {
             out
         }
     }
-    incr ::level -1
+    incr level -1
 }
 
 rproc xsd::sequence {node} {
@@ -525,34 +549,34 @@ rproc xsd::sequence {node} {
     if {[[$node parentNode] localName] eq "choice"} {
         set insideChoice 1
         sput "group [getQuant $node] \{"
-        incr ::level
+        incr level
     }
     foreach child [$node selectNodes xsd:*] {
         [$child localName] $child
     }
     if {$insideChoice} {
         sput "\}"
-        incr ::level -1
+        incr level -1
     }
 }
 
 rproc xsd::choice {node} {
     sput "choice [getQuant $node] \{"
-    incr ::level
+    incr level
     foreach child [$node selectNodes xsd:*] {
         [$child localName] $child
     }
-    incr ::level -1
+    incr level -1
     sput "\}"
 }
 
 rproc xsd::all {node} {
     sput "interleave [getQuant $node] \{"
-    incr ::level
+    incr level
     foreach child [$node selectNodes xsd:*] {
         [$child localName] $child
     }
-    incr ::level
+    incr level
     sput "\}"
 }
 
@@ -583,9 +607,9 @@ rproc xsd::elementWorker {node} {
                 append result "text\n"
             } elseif {[string first " " $texttypecode] > -1} {
                 append result "\{\n"
-                incr ::level
+                incr level
                 sput "text \{$texttypecode\}"
-                incr ::level -1
+                incr level -1
                 sput "\}"
             } else {
                 append result "\{text $texttypecode\}\n"
@@ -605,7 +629,7 @@ rproc xsd::elementWorker {node} {
             if {[llength $attdefinitions]} {
                 set haveScriptStart 1
                 append result "\{\n"
-                incr ::level
+                incr level
                 foreach child $attdefinitions {
                     [$child localName] $child
                 }
@@ -619,16 +643,16 @@ rproc xsd::elementWorker {node} {
             } else {
                 if {!$haveScriptStart} {
                     append result "\{\n"
-                    incr ::level
+                    incr level
                 }
                 sput "namespace [dict get $xsddata nsprefix $thisns] \{ref $type\}"
                 if {!$haveScriptStart} {
-                    incr ::level -1
+                    incr level -1
                     sput "\}"
                 }
             }
             if {$haveScriptStart} {
-                incr ::level -1
+                incr level -1
                 sput "\}"
             }
             return
@@ -639,11 +663,11 @@ rproc xsd::elementWorker {node} {
     } else {
         # Local defined type
         append result "\{\n"
-        incr ::level
+        incr level
         foreach child [$node selectNodes xsd:*] {
             [$child localName] $child
         }
-        incr ::level -1
+        incr level -1
         sput "\}"
     }
 }
@@ -658,9 +682,9 @@ rproc xsd::element {node} {
             sput "element $name [getQuant $node]"
         } else {
             sput "namespace [$dict get $xsddata nsprefix $ns] \{"
-            incr ::level
+            incr level
             sput "element $name [getQuant $node]"
-            incr ::level
+            incr level
             sput "\}"
         }
         return
@@ -674,13 +698,13 @@ rproc xsd::simpleType {node} {
     if {[[$node parentNode] localName] ne "attribute"} {
         set forattribute 0
         sput "text \{"
-        incr ::level
+        incr level
     }
     foreach child [$node selectNodes xsd:*] {
         [$child localName] $child
     }
     if {!$forattribute} {
-        incr ::level -1
+        incr level -1
         sput "\}"
     }
 }
@@ -701,11 +725,11 @@ rproc xsd::complexType {node} {
                     } else {
                         sput "mixed $quant \{"
                     }
-                    incr ::level
+                    incr level
                     foreach childchild [$child selectNodes xsd:*] {
                         [$childchild localName] $childchild
                     }
-                    incr ::level -1
+                    incr level -1
                     sput "\}"
                 }
                 "sequence" {
@@ -753,13 +777,13 @@ rproc xsd::complexContent {node} {
     set mixed [$node @mixed 0]
     if {$mixed} {
         sput "mixed \{"
-        incr ::level
+        incr level
     }
     foreach child [$node selectNodes xsd:*] {
         [$child localName] $child
     }
     if {$mixed} {
-        incr ::level -1
+        incr level -1
         sput "\}"
     }
 }
@@ -891,11 +915,11 @@ rproc xsd::textType {node {start ""}} {
         if {$texttypecode ne ""} {
             if {[string first " " $texttypecode] > -1} {
                 sput " \{"
-                incr ::level
+                incr level
                 foreach line [split $texttypecode "\n"] {
                     sput $line
                 }
-                incr ::level -1
+                incr level -1
                 sput "\}"
             } else {
                 append result " $texttypecode\n"
@@ -949,11 +973,11 @@ rproc xsd::attribute {node} {
         if {[llength $childs]} {
             # Local definition by simpleType
             sput "$start \{"
-            incr ::level
+            incr level
             foreach child [$node selectNodes xsd:*] {
                 [$child localName] $child
             }
-            incr ::level -1
+            incr level -1
             sput "\}"
         } else {
             sput $start
@@ -968,8 +992,9 @@ proc xsd::notation {node} {
 proc xsd::processGlobalGroup {} {
     variable xsddata
     variable targetns
+    variable level
     
-    incr ::level
+    incr level
     dict for {targetns nsdata} [dict get $xsddata namespace] {
         if {![dict exists $nsdata group]} continue
         dict for {group data} [dict get $nsdata group] {
@@ -982,14 +1007,15 @@ proc xsd::processGlobalGroup {} {
             out
         }
     }
-    incr ::level -1
+    incr level -1
 }
 
 proc xsd::processGlobalComplexTypes {} {
     variable xsddata
     variable targetns
+    variable level
 
-    incr ::level
+    incr level
     dict for {targetns nsdata} [dict get $xsddata namespace] {
         if {![dict exists $nsdata complexType]} continue
         dict for {complexType ctdata} [dict get $nsdata complexType] {
@@ -1004,7 +1030,7 @@ proc xsd::processGlobalComplexTypes {} {
             out
         }
     }
-    incr ::level -1
+    incr level -1
 }
 
 proc xsd::processGlobalElements {} {
@@ -1023,18 +1049,39 @@ proc xsd::processGlobalElements {} {
     }
 }
 
-set basedir [file dirname [file normalize [lindex $argv 0]]]
-set xsddoc [dom parse [xmlReadFile [lindex $argv 0]]]
-$xsddoc selectNodesNamespaces {
-    xsd "http://www.w3.org/2001/XMLSchema"
-}
-set xsd [$xsddoc documentElement]
-set xsd::targetNS [$xsd @targetNamespace ""]
+proc xsd::generateSchema {file} {
+    variable level 0
+    variable targetNS ""
+    variable basedir
+    variable xsddata  [dict create]
+    variable output
+    
+    set basedir [file dirname [file normalize [lindex $file 0]]]
+    set xsddoc [dom parse [xmlReadFile [lindex $file 0]]]
+    $xsddoc selectNodesNamespaces {
+        xsd "http://www.w3.org/2001/XMLSchema"
+    }
+    set xsd [$xsddoc documentElement]
+    set targetNS [$xsd @targetNamespace ""]
 
-xsd::prolog
-xsd::processToplevel $xsd
-xsd::processNamespaces
-xsd::processGlobalSimpleTypes
-xsd::processGlobalGroup
-xsd::processGlobalComplexTypes
-xsd::processGlobalElements
+    xsd::prolog
+    xsd::processToplevel $xsd
+    xsd::processNamespaces
+    xsd::processGlobalSimpleTypes
+    xsd::processGlobalGroup
+    xsd::processGlobalComplexTypes
+    xsd::processGlobalElements
+    if {$output eq "collect"} {
+        variable schema
+        return $schema
+    }
+}
+
+if {[info exists argv0] && [file tail [info script]] eq [file tail $argv0]} {
+    if {$argc != 1} {
+        puts stderr "Usage: $argv0 <xsd-file>"
+        exit 1
+    }
+    set ::xsd::output ""
+    xsd::generateSchema [lindex $argv 0]
+}
