@@ -364,7 +364,7 @@ proc xsd::mapXsdTypeToSchema {type} {
 
 rproc xsd::restriction {node} {
     variable xsddata
-    variable targetns
+    variable targetNS
     variable level
 
     set base [$node @base ""]
@@ -399,7 +399,7 @@ rproc xsd::restriction {node} {
             } else {
                 # Derived from another simple Type
                 if {$typens eq ""} {
-                    set typens $targetns
+                    set typens $targetNS
                 }
                 if {$typens ne ""} {
                     sput "type [dict get $xsddata nsprefix $typens]:$type"
@@ -521,16 +521,16 @@ rproc xsd::list {node} {
 
 proc xsd::processGlobalSimpleTypes {} {
     variable xsddata
-    variable targetns
+    variable targetNS
     variable level
     
     incr level
-    dict for {targetns nsdata} [dict get $xsddata namespace] {
+    dict for {targetNS nsdata} [dict get $xsddata namespace] {
         if {![dict exists $nsdata simpleType]} continue
         dict for {simpleType stdata} [dict get $nsdata simpleType] {
             set xsd [dict get $stdata xsd]
-            if {$targetns ne ""} {
-                set result "deftexttype [dict get $xsddata nsprefix $targetns]:$simpleType \{\n"
+            if {$targetNS ne ""} {
+                set result "deftexttype [dict get $xsddata nsprefix $targetNS]:$simpleType \{\n"
             } else {
                 set result "deftexttype $simpleType \{\n"
             }
@@ -588,7 +588,7 @@ rproc xsd::group {node} {
 
 rproc xsd::elementWorker {node} {
     variable xsddata
-    variable targetns
+    variable targetNS
 
     set type [$node @type ""]
     if {$type ne ""} {
@@ -598,7 +598,7 @@ rproc xsd::elementWorker {node} {
             lassign [split $type :] prefix type
             set thisns [nsfromprefix $node $prefix]
         } else {
-            set thisns $targetns
+            set thisns $targetNS
         }
         # Check for text only element with basic data type
         if {$thisns eq "http://www.w3.org/2001/XMLSchema"} {
@@ -634,7 +634,7 @@ rproc xsd::elementWorker {node} {
                     [$child localName] $child
                 }
             }
-            if {$thisns eq $targetns} {
+            if {$thisns eq $targetNS} {
                 if {$haveScriptStart} {
                     sput "ref $type"
                 } else {
@@ -674,11 +674,11 @@ rproc xsd::elementWorker {node} {
 
 rproc xsd::element {node} {
     variable xsddata
-    variable targetns
+    variable targetNS
     
     if {[$node hasAttribute ref]} {
         lassign [resolveFQ [$node @ref] $node] ns name
-        if {$targetns eq $ns} {
+        if {$targetNS eq $ns} {
             sput "element $name [getQuant $node]"
         } else {
             sput "namespace [$dict get $xsddata nsprefix $ns] \{"
@@ -991,15 +991,15 @@ proc xsd::notation {node} {
 
 proc xsd::processGlobalGroup {} {
     variable xsddata
-    variable targetns
+    variable targetNS
     variable level
     
     incr level
-    dict for {targetns nsdata} [dict get $xsddata namespace] {
+    dict for {targetNS nsdata} [dict get $xsddata namespace] {
         if {![dict exists $nsdata group]} continue
         dict for {group data} [dict get $nsdata group] {
             set xsd [dict get $data xsd]
-            append result "\ndefpattern $group [dict get $xsddata nsprefix $targetns] \{\n"
+            append result "\ndefpattern $group [dict get $xsddata nsprefix $targetNS] \{\n"
             foreach child [$xsd selectNodes xsd:*] {
                 append result "[[$child localName] $child]\n"
             }
@@ -1012,15 +1012,15 @@ proc xsd::processGlobalGroup {} {
 
 proc xsd::processGlobalComplexTypes {} {
     variable xsddata
-    variable targetns
+    variable targetNS
     variable level
 
     incr level
-    dict for {targetns nsdata} [dict get $xsddata namespace] {
+    dict for {targetNS nsdata} [dict get $xsddata namespace] {
         if {![dict exists $nsdata complexType]} continue
         dict for {complexType ctdata} [dict get $nsdata complexType] {
             set xsd [dict get $ctdata xsd]
-            set result "defpattern $complexType [dict get $xsddata nsprefix $targetns] \{\n"
+            set result "defpattern $complexType [dict get $xsddata nsprefix $targetNS] \{\n"
             foreach child [$xsd selectNodes {
                 xsd:*[local-name() != 'attribute' and local-name() != 'attributeGroup']
             }] {
@@ -1035,14 +1035,14 @@ proc xsd::processGlobalComplexTypes {} {
 
 proc xsd::processGlobalElements {} {
     variable xsddata
-    variable targetns
+    variable targetNS
 
     set result ""
-    dict for {targetns nsdata} [dict get $xsddata namespace] {
+    dict for {targetNS nsdata} [dict get $xsddata namespace] {
         if {![dict exists $nsdata element]} continue
         dict for {element elmdata} [dict get $nsdata element] {
             set xsd [dict get $elmdata xsd]
-            set result "defelement $element $targetns "
+            set result "defelement $element $targetNS "
             elementWorker $xsd
             out 1
         }
