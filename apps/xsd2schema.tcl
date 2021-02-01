@@ -25,7 +25,6 @@ namespace eval xsd {
         NCName ncname
         NMTOKEN nmtoken
         QName qname
-        float double
     }]
 }
 
@@ -62,6 +61,11 @@ proc xsd::indent {} {
     return [string repeat " " [expr {$indent * $level}]]
 }
 
+proc xsd::prefix {ns} {
+    variable xsddata
+    return [dict get $xsddata nsprefix $ns]
+}
+    
 proc rproc {name args body} {
     proc $name $args "variable level;upvar result result;$body"
 }
@@ -82,7 +86,7 @@ rproc xsd::sputc {text} {
 
 rproc xsd::sputce {text} {
     foreach line [split $text "\n"] {
-        append result "[indent]# LOOK_AT $line\n"
+        append result "\n[indent]# LOOK_AT $line\n"
     }
 }
 
@@ -97,7 +101,7 @@ rproc xsd::out {{nonl 0}} {
         if {$nonl} {
             append schema $result
         } else {
-            append $result "\n"
+            append schema $result "\n"
         }
     } else {
         if {$nonl} {
@@ -168,14 +172,20 @@ proc xsd::nsfromprefix {contextNode prefix} {
 
 }
 
-proc xsd::resolveFQ {name node} {
+proc xsd::resolveFQ {name node {forAtt 0}} {
     if {[string first : $name] > -1} {
         lassign [split $name :] prefix name
         return [::list [nsfromprefix $node $prefix] $name]
     } else {
-        return [::list \
-                    [lindex [lindex [$node selectNodes {namespace::*[name()='']}] 0] 1]\
-                    $name]
+        if {$forAtt} {
+            return [::list "" $name]
+        } else {
+            return [::list \
+                        [lindex [lindex [$node selectNodes {
+                            namespace::*[name()='']
+                        }] 0] 1]\
+                        $name]
+        }
     }
 }
 
@@ -309,8 +319,10 @@ proc xsd::mapXsdTypeToSchema {type} {
         }
         "anyURI" -
         "byte" -
+        "double" -
         "ENTITIES" -
         "ENTITY" -
+        "float" -
         "gDay" -
         "gMonth" -
         "gMonthDay" -
@@ -326,7 +338,7 @@ proc xsd::mapXsdTypeToSchema {type} {
             return "split idref"
         }
         "language" {
-            return "pattern {^[a-zA-Z]{1,8}(-[a-zA-Z0-9]{1,8})*$}"
+            return {regexp {^[a-zA-Z]{1,8}(-[a-zA-Z0-9]{1,8})*$}}
         }
         "NMTOKENS" {
             return "split nmtoken"
@@ -382,7 +394,7 @@ rproc xsd::restriction {node} {
                     annotation $firstxsdchild
                 }
                 set enumerations [$node selectNodes xsd:enumeration]
-                if {[llength selectNodes]} {
+                if {[llength $enumerations]} {
                     sput "enumeration \{"
                     incr level
                     foreach enumeration $enumerations {
@@ -617,7 +629,7 @@ rproc xsd::elementWorker {node} {
             return
         }
         if {[dict exists $xsddata namespace $thisns simpleType $type]} {
-            sput "\{text type $thisns:$type\}"
+            sput "\{text type [prefix $thisns]:$type\}"
             return
         } elseif {[dict exists $xsddata namespace $thisns complexType $type]} {
             set xsd [dict get $xsddata namespace $thisns complexType $type xsd]
@@ -836,6 +848,14 @@ rproc xsd::key {node} {
     sputce "key not implemented"
 }
 
+rproc xsd::keyref {node} {
+    sputce "keyref not implemented"
+}
+
+rproc xsd::unique {node} {
+    sputce "unique not implemented"
+}
+
 rproc xsd::any {node} {
     set quant [getQuant $node]
     # Could be only annotation, in valid schema
@@ -952,10 +972,10 @@ rproc xsd::attribute {node} {
         }
     }
     if {[$node hasAttribute ref]} {
-        lassign [resolveFQ [$node @ref] $node] ns name
+        lassign [resolveFQ [$node @ref] $node 1] ns name
         set node [dict get $xsddata namespace $ns attribute $name xsd]
     } else {
-        lassign [resolveFQ [$node @name] $node] ns name
+        lassign [resolveFQ [$node @name] $node 1] ns name
     }
     if {$ns eq ""} {
         set start "attribute $name $quant"
@@ -1055,6 +1075,7 @@ proc xsd::generateSchema {file} {
     variable basedir
     variable xsddata  [dict create]
     variable output
+    variable schema ""
     
     set basedir [file dirname [file normalize [lindex $file 0]]]
     set xsddoc [dom parse [xmlReadFile [lindex $file 0]]]
@@ -1072,7 +1093,6 @@ proc xsd::generateSchema {file} {
     xsd::processGlobalComplexTypes
     xsd::processGlobalElements
     if {$output eq "collect"} {
-        variable schema
         return $schema
     }
 }

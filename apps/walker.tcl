@@ -41,14 +41,18 @@ proc walktestSet {file} {
         ts "http://www.w3.org/XML/2004/xml-schema-test-suite/"
     }
     foreach testGroup [$set selectNodes $query(invalidxml)] {
-        puts [$testGroup asXML]
         set xsdfile [file normalize \
                          [file join $base [$testGroup selectNodes {
                              string(ts:schemaTest/ts:schemaDocument/@xlink:href)
                          }]]]
         tdom::schema s
-        puts "xsdfile: $xsdfile"
-        s define [xsd::generateSchema $xsdfile]
+        if {[catch {
+            s define [xsd::generateSchema $xsdfile]
+        } errMsg]} {
+            puts "xsdfile: $xsdfile"
+            puts $::errorInfo
+            exit
+        }
         incr ::schemaFileCounter
         foreach instanceTest [$testGroup selectNodes {ts:intanceTest[ts:expected/@validity = 'invalid']}] {
             if {[s validatefile [file normalize [file join $base [$instanceTest selectNodes {string(ts:instanceDocument/@xlink:href)}]]]]} {
