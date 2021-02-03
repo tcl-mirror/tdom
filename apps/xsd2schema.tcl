@@ -33,9 +33,10 @@ namespace eval xsd {
 proc xsd::tclxsdtypes {type value} {
     switch $type {
         default {
-            error "Type $type not implemented"
+            puts  "Type $type not implemented"
         }
     }
+    return 1
 }
 
 proc xsd::prolog {} {
@@ -212,7 +213,7 @@ proc xsd::processNamespaces {} {
     set level 0
 }
 
-proc xsd::import {import} {
+rproc xsd::import {import} {
     variable xsddata
     variable targetNS
     variable basedir
@@ -236,7 +237,7 @@ proc xsd::import {import} {
         set targetNS [$xsd @targetNamespace ""]
         processToplevel $xsd
     } on error errMsg {
-        sputce "Can't import\n[$import asXML]$errMsg"
+        sputce "Can't access\n[$import asXML]$errMsg"
         out
         exit
     } finally {
@@ -244,13 +245,13 @@ proc xsd::import {import} {
     }
 }
 
-proc xsd::include {include} {
+rproc xsd::include {include} {
     variable xsddata
     variable basedir
     
-    set schemaLocation [$import @schemaLocation ""]
+    set schemaLocation [$include @schemaLocation ""]
     if {$schemaLocation eq ""} {
-        sputce "import: skiping because of missing schemaLocation\n[$import asXML]"
+        sputce "include: skiping because of missing schemaLocation\n[$include asXML]"
         return
     }
     if {[dict exists $xsddata included $schemaLocation]} {
@@ -265,10 +266,38 @@ proc xsd::include {include} {
         set xsd [$xsddoc documentElement]
         processToplevel $xsd
     } on error errMsg {
-        sputce "Can't import\n[$import asXML]$errMsg"
+        sputce "Can't access\n[$include asXML]$errMsg"
         out
         exit
     }        
+}
+
+rproc xsd::redefine {redefine} {
+    variable xsddata
+    variable basedir
+
+    set schemaLocation [$redefine @schemaLocation ""]
+    if {$schemaLocation eq ""} {
+        sputce "redefine: skiping because of missing schemaLocation\n[$redefine asXML]"
+        return
+    }
+    if {[dict exists $xsddata redefined $schemaLocation]} {
+        return
+    }
+    sputce "Global element redefine just includes, but does not actually redefine, so far"
+    dict set xsddata redefined $schemaLocation ""
+    try {
+        set xsddoc [dom parse [xmlReadFile [file join $basedir $schemaLocation]]]
+        $xsddoc selectNodesNamespaces {
+            xsd "http://www.w3.org/2001/XMLSchema"
+        }
+        set xsd [$xsddoc documentElement]
+        processToplevel $xsd
+    } on error errMsg {
+        sputce "Can't access\n[$redefine asXML]$errMsg"
+        out
+        exit
+    }
 }
 
 proc xsd::processToplevel {xsd} {
@@ -279,11 +308,10 @@ proc xsd::processToplevel {xsd} {
         set localname [$toplevelelm localName]
         incr ::ecount($localname)
         switch $localname {
-            "redefine" {
-                sputce "Global level $localname not implemented, so far"
-            }
+            "annotation" -
             "import" -
-            "include" {
+            "include" -
+            "redefine" {
                 $localname $toplevelelm
             }
             "annotation" {
@@ -299,8 +327,8 @@ proc xsd::processToplevel {xsd} {
                 dict set xsddata namespace $targetNS $localname $name xsd $toplevelelm
             }
         }
+        out
     }
-    out
 }
 
 proc xsd::mapXsdTypeToSchema {type} {
@@ -377,9 +405,11 @@ proc xsd::mapXsdTypeToSchema {type} {
 rproc xsd::restriction {node} {
     variable xsddata
     variable targetNS
-    variable level
+    variable currentBase
 
-    set base [$node @base ""]
+    set savedCurrentBase $currentBase
+    set currentBase [$node @base $currentBase]
+    set base $currentBase
     lassign [resolveFQ $base $node] typens type
     set context [[$node parentNode] localName] 
     switch $context {
@@ -402,6 +432,7 @@ rproc xsd::restriction {node} {
                     }
                     incr level -1
                     sput "\}"
+                    set currentBase $savedCurrentBase
                     return
                 }
                 set tdomtype [mapXsdTypeToSchema $type]
@@ -427,9 +458,10 @@ rproc xsd::restriction {node} {
             sputce "complexType restriction to do"
         }
     }
-    foreach child [$node selectNodes xsd:*] {
-        [$child localName] $child
-    }
+    # foreach child [$node selectNodes xsd:*] {
+    #     [$child localName] $child
+    # }
+    set currentBase $savedCurrentBase
 }
 
 rproc xsd::enumeration {node} {
@@ -464,7 +496,7 @@ rproc xsd::maxLength {node} {
     foreach child [$node selectNodes xsd:*] {
         [$child localName] $child
     }
-    sput "maxLength \{[$node @value]\}"
+    sput "maxLength [$node @value]"
 }
 
 rproc xsd::minExclusive {node} {
@@ -481,7 +513,7 @@ rproc xsd::minLength {node} {
     foreach child [$node selectNodes xsd:*] {
         [$child localName] $child
     }
-    sput "minLength \{[$node @value]\}"
+    sput "minLength [$node @value]"
 }
 
 rproc xsd::pattern {node} {
@@ -810,8 +842,11 @@ proc xsd::getSimpleType {ns type} {
 
 rproc xsd::extension {node} {
     variable xsddata
+    variable currentBase
     
-    set base [$node @base ""]
+    set savedCurrentBase $currentBase
+    set currentBase [$node @base $currentBase]
+    set base $currentBase
     lassign [resolveFQ $base $node] typens type
     set context [[$node parentNode] localName] 
     switch $context {
@@ -841,6 +876,7 @@ rproc xsd::extension {node} {
     }] {
         [$child localName] $child
     }
+    set currentBase $savedCurrentBase
     sputce "extension not implemented"
 }
 
@@ -897,7 +933,7 @@ rproc xsd::any {node} {
             }
             if {[llength $nsonly]} {
                 if {[llength $nsonly] == 1} {
-                    append result "any $quant [lindex $nsonly 0]"
+                    sput "any [lindex $nsonly 0] $quant"
                 } else {
                     append result "choice $quant \{\n"
                     foreach ns $nsonly {
@@ -1076,6 +1112,7 @@ proc xsd::generateSchema {file} {
     variable xsddata  [dict create]
     variable output
     variable schema ""
+    variable currentBase ""
     
     set basedir [file dirname [file normalize [lindex $file 0]]]
     set xsddoc [dom parse [xmlReadFile [lindex $file 0]]]

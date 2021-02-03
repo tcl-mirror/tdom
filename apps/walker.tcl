@@ -1,3 +1,7 @@
+# This helper and test script works with the w3c xsd test suite.
+# Get it from
+# https://github.com/w3c/xsdtests/archive/master.zip
+
 package require tdom
 namespace import tdom::*
 
@@ -49,6 +53,7 @@ proc walktestSet {file} {
         if {[catch {
             s define [xsd::generateSchema $xsdfile]
         } errMsg]} {
+            puts $::schemaFileCounter
             puts "xsdfile: $xsdfile"
             puts $::errorInfo
             exit
